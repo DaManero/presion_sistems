@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -19,6 +20,24 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Presion Bot Backend", version="0.1.0")
 
+REQUIRED_ENV_VARS = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "GEMINI_API_KEY",
+    "GOOGLE_SHEETS_ID",
+    "GOOGLE_SERVICE_ACCOUNT_JSON",
+]
+
+
+@dataclass
+class Settings:
+    telegram_bot_token: str
+    telegram_webhook_secret: str
+    gemini_api_key: str
+    google_sheets_id: str
+    google_service_account_json: str
+    timezone: str
+
 
 def _get_required_env(name: str) -> str:
     value = os.getenv(name)
@@ -27,29 +46,37 @@ def _get_required_env(name: str) -> str:
     return value
 
 
-TELEGRAM_BOT_TOKEN = _get_required_env("TELEGRAM_BOT_TOKEN")
-TELEGRAM_WEBHOOK_SECRET = _get_required_env("TELEGRAM_WEBHOOK_SECRET")
-GEMINI_API_KEY = _get_required_env("GEMINI_API_KEY")
-GOOGLE_SHEETS_ID = _get_required_env("GOOGLE_SHEETS_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = _get_required_env("GOOGLE_SERVICE_ACCOUNT_JSON")
-TIMEZONE = os.getenv("TZ", "America/Argentina/Buenos_Aires")
-
-TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-TELEGRAM_FILE_BASE = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
+def _get_missing_env_vars() -> list[str]:
+    return [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]
 
 
-genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+def _get_settings() -> Settings:
+    return Settings(
+        telegram_bot_token=_get_required_env("TELEGRAM_BOT_TOKEN"),
+        telegram_webhook_secret=_get_required_env("TELEGRAM_WEBHOOK_SECRET"),
+        gemini_api_key=_get_required_env("GEMINI_API_KEY"),
+        google_sheets_id=_get_required_env("GOOGLE_SHEETS_ID"),
+        google_service_account_json=_get_required_env(
+            "GOOGLE_SERVICE_ACCOUNT_JSON"
+        ),
+        timezone=os.getenv("TZ", "America/Argentina/Buenos_Aires"),
+    )
 
 
-def _get_sheet():
-    creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+def _require_settings() -> Settings:
+    missing = _get_missing_env_vars()
+    if missing:
+        raise RuntimeError(
+            "Missing required env vars: " + ", ".join(sorted(missing))
+        )
+    return _get_settings()
+
+
+def _get_sheet(settings: Settings):
+    creds_info = json.loads(settings.google_service_account_json)
     client = gspread.service_account_from_dict(creds_info)
-    sheet = client.open_by_key(GOOGLE_SHEETS_ID).sheet1
+    sheet = client.open_by_key(settings.google_sheets_id).sheet1
     return sheet
-
-
-SHEET = _get_sheet()
 
 
 def _clean_json(text: str) -> dict[str, Any]:
@@ -73,10 +100,13 @@ def _is_valid_range(systolic: int, diastolic: int, pulse: int) -> bool:
     )
 
 
-async def _telegram_get_file_path(file_id: str) -> str:
+async def _telegram_get_file_path(settings: Settings, file_id: str) -> str:
+    telegram_api_base = (
+        f"https://api.telegram.org/bot{settings.telegram_bot_token}"
+    )
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
-            f"{TELEGRAM_API_BASE}/getFile",
+            f"{telegram_api_base}/getFile",
             params={"file_id": file_id},
         )
         resp.raise_for_status()
@@ -90,24 +120,37 @@ async def _telegram_get_file_path(file_id: str) -> str:
     return file_path
 
 
-async def _telegram_download_file(file_path: str) -> bytes:
+async def _telegram_download_file(settings: Settings, file_path: str) -> bytes:
+    telegram_file_base = (
+        f"https://api.telegram.org/file/bot{settings.telegram_bot_token}"
+    )
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.get(f"{TELEGRAM_FILE_BASE}/{file_path}")
+        resp = await client.get(f"{telegram_file_base}/{file_path}")
         resp.raise_for_status()
         return resp.content
 
 
-async def _telegram_send_message(chat_id: int, text: str) -> None:
+async def _telegram_send_message(
+    settings: Settings,
+    chat_id: int,
+    text: str,
+) -> None:
+    telegram_api_base = (
+        f"https://api.telegram.org/bot{settings.telegram_bot_token}"
+    )
     payload = {"chat_id": chat_id, "text": text}
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            f"{TELEGRAM_API_BASE}/sendMessage",
+            f"{telegram_api_base}/sendMessage",
             json=payload,
         )
         resp.raise_for_status()
 
 
-def _extract_measurement_from_image(image_bytes: bytes) -> dict[str, Any]:
+def _extract_measurement_from_image(
+    settings: Settings,
+    image_bytes: bytes,
+) -> dict[str, Any]:
     prompt = (
         "Extract blood pressure values from this image of a pressure monitor. "
         "Return only JSON with keys: systolic, diastolic, pulse, "
@@ -115,7 +158,9 @@ def _extract_measurement_from_image(image_bytes: bytes) -> dict[str, Any]:
         "Rules: all values must be integers, confidence from 0 to 1. "
         "If any value is not readable, set it to null and explain in notes."
     )
-    response = GEMINI_MODEL.generate_content(
+    genai.configure(api_key=settings.gemini_api_key)
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    response = gemini_model.generate_content(
         [
             {
                 "mime_type": "image/jpeg",
@@ -155,8 +200,15 @@ def _extract_measurement_from_image(image_bytes: bytes) -> dict[str, Any]:
     }
 
 
-def _append_row(data: dict[str, Any], telegram_file_id: str) -> None:
-    now = datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds")
+def _append_row(
+    settings: Settings,
+    data: dict[str, Any],
+    telegram_file_id: str,
+) -> None:
+    sheet = _get_sheet(settings)
+    now = datetime.now(ZoneInfo(settings.timezone)).isoformat(
+        timespec="seconds"
+    )
     row = [
         now,
         data.get("sistolica"),
@@ -168,12 +220,19 @@ def _append_row(data: dict[str, Any], telegram_file_id: str) -> None:
         data.get("observacion"),
         telegram_file_id,
     ]
-    SHEET.append_row(row, value_input_option="USER_ENTERED")
+    sheet.append_row(row, value_input_option="USER_ENTERED")
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    missing = _get_missing_env_vars()
+    if missing:
+        return {
+            "status": "degraded",
+            "configured": False,
+            "missing_env_vars": missing,
+        }
+    return {"status": "ok", "configured": True}
 
 
 @app.post("/webhook/telegram")
@@ -181,7 +240,9 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
-    if x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+    settings = _require_settings()
+
+    if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
         raise HTTPException(status_code=401, detail="invalid webhook secret")
 
     update = await request.json()
@@ -195,6 +256,7 @@ async def telegram_webhook(
     photos = message.get("photo") or []
     if not photos:
         await _telegram_send_message(
+            settings,
             chat_id,
             "No detecte una foto. Enviame una imagen del tensiometro.",
         )
@@ -205,16 +267,17 @@ async def telegram_webhook(
     file_id = best_photo.get("file_id")
     if not file_id:
         await _telegram_send_message(
+            settings,
             chat_id,
             "No pude obtener el archivo de la foto.",
         )
         return JSONResponse({"ok": True, "ignored": "missing file id"})
 
     try:
-        file_path = await _telegram_get_file_path(file_id)
-        image_bytes = await _telegram_download_file(file_path)
-        data = _extract_measurement_from_image(image_bytes)
-        _append_row(data, file_id)
+        file_path = await _telegram_get_file_path(settings, file_id)
+        image_bytes = await _telegram_download_file(settings, file_path)
+        data = _extract_measurement_from_image(settings, image_bytes)
+        _append_row(settings, data, file_id)
 
         if data["estado"] == "auto":
             text = (
@@ -229,11 +292,12 @@ async def telegram_webhook(
                 f"pulso {data.get('pulso')}."
             )
 
-        await _telegram_send_message(chat_id, text)
+        await _telegram_send_message(settings, chat_id, text)
         return JSONResponse({"ok": True})
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error processing Telegram webhook")
         await _telegram_send_message(
+            settings,
             chat_id,
             "Hubo un error al procesar la imagen. "
             "Intenta de nuevo con una foto mas clara.",
