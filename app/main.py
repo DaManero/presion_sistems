@@ -249,7 +249,7 @@ async def _process_telegram_photo(
             )
 
         await _telegram_send_message(settings, chat_id, text)
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("Error processing Telegram webhook")
         await _telegram_send_message(
             settings,
