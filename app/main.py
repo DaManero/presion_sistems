@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ from zoneinfo import ZoneInfo
 import gspread
 import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 import google.generativeai as genai
 
@@ -256,7 +257,13 @@ async def _process_telegram_photo(
             "Hubo un error al procesar la imagen. "
             "Intenta de nuevo con una foto mas clara.",
         )
-        raise exc
+
+
+def _log_background_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except Exception:  # noqa: BLE001
+        logger.exception("Background Telegram task failed")
 
 
 @app.get("/health")
@@ -273,7 +280,6 @@ async def health() -> dict[str, Any]:
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(
-    background_tasks: BackgroundTasks,
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
@@ -310,10 +316,8 @@ async def telegram_webhook(
         )
         return JSONResponse({"ok": True, "ignored": "missing file id"})
 
-    background_tasks.add_task(
-        _process_telegram_photo,
-        settings,
-        chat_id,
-        file_id,
+    task = asyncio.create_task(
+        _process_telegram_photo(settings, chat_id, file_id)
     )
+    task.add_done_callback(_log_background_task_result)
     return JSONResponse({"ok": True, "queued": True})
