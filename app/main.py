@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import gspread
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 import google.generativeai as genai
 
@@ -223,6 +223,42 @@ def _append_row(
     sheet.append_row(row, value_input_option="USER_ENTERED")
 
 
+async def _process_telegram_photo(
+    settings: Settings,
+    chat_id: int,
+    file_id: str,
+) -> None:
+    try:
+        file_path = await _telegram_get_file_path(settings, file_id)
+        image_bytes = await _telegram_download_file(settings, file_path)
+        data = _extract_measurement_from_image(settings, image_bytes)
+        _append_row(settings, data, file_id)
+
+        if data["estado"] == "auto":
+            text = (
+                f"Guardado: {data['sistolica']}/{data['diastolica']} mmHg, "
+                f"pulso {data['pulso']}"
+            )
+        else:
+            text = (
+                "Guardado con revision pendiente. "
+                "Valores detectados: "
+                f"{data.get('sistolica')}/{data.get('diastolica')} mmHg, "
+                f"pulso {data.get('pulso')}."
+            )
+
+        await _telegram_send_message(settings, chat_id, text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error processing Telegram webhook")
+        await _telegram_send_message(
+            settings,
+            chat_id,
+            "Hubo un error al procesar la imagen. "
+            "Intenta de nuevo con una foto mas clara.",
+        )
+        raise exc
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     missing = _get_missing_env_vars()
@@ -237,6 +273,7 @@ async def health() -> dict[str, Any]:
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(
+    background_tasks: BackgroundTasks,
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
@@ -273,33 +310,10 @@ async def telegram_webhook(
         )
         return JSONResponse({"ok": True, "ignored": "missing file id"})
 
-    try:
-        file_path = await _telegram_get_file_path(settings, file_id)
-        image_bytes = await _telegram_download_file(settings, file_path)
-        data = _extract_measurement_from_image(settings, image_bytes)
-        _append_row(settings, data, file_id)
-
-        if data["estado"] == "auto":
-            text = (
-                f"Guardado: {data['sistolica']}/{data['diastolica']} mmHg, "
-                f"pulso {data['pulso']}"
-            )
-        else:
-            text = (
-                "Guardado con revision pendiente. "
-                "Valores detectados: "
-                f"{data.get('sistolica')}/{data.get('diastolica')} mmHg, "
-                f"pulso {data.get('pulso')}."
-            )
-
-        await _telegram_send_message(settings, chat_id, text)
-        return JSONResponse({"ok": True})
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Error processing Telegram webhook")
-        await _telegram_send_message(
-            settings,
-            chat_id,
-            "Hubo un error al procesar la imagen. "
-            "Intenta de nuevo con una foto mas clara.",
-        )
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    background_tasks.add_task(
+        _process_telegram_photo,
+        settings,
+        chat_id,
+        file_id,
+    )
+    return JSONResponse({"ok": True, "queued": True})
