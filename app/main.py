@@ -240,20 +240,29 @@ def _extract_measurement_from_image(
         "Rules: all values must be integers, confidence from 0 to 1. "
         "If any value is not readable, set it to null and explain in notes."
     )
-    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+    model_name = model_name.replace("models/", "")
+    fallback_raw = os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash-latest",
+    )
+    fallback_models = [
+        m.strip().replace("models/", "")
+        for m in fallback_raw.split(",")
+        if m.strip()
+    ]
+    model_candidates = [model_name, *fallback_models]
+    # Preserve order while deduplicating.
+    model_candidates = list(dict.fromkeys(model_candidates))
     config_time = perf_counter() - step_start
     logger.info(f"Gemini request setup in {config_time:.2f}s")
 
     step_start = perf_counter()
     logger.info(
-        "[%s] Sending image to Gemini REST API (model=%s size=%s bytes)",
+        "[%s] Sending image to Gemini REST API (models=%s size=%s bytes)",
         trace_id,
-        model_name,
+        model_candidates,
         len(image_bytes),
-    )
-    gemini_url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model_name}:generateContent"
     )
     payload = {
         "contents": [
@@ -280,14 +289,38 @@ def _extract_measurement_from_image(
         write=min(30.0, GEMINI_TIMEOUT_SECONDS),
         pool=min(15.0, GEMINI_TIMEOUT_SECONDS),
     )
+    response = None
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.post(
-                gemini_url,
-                headers={"x-goog-api-key": settings.gemini_api_key},
-                json=payload,
-            )
-            response.raise_for_status()
+            for current_model in model_candidates:
+                gemini_url = (
+                    "https://generativelanguage.googleapis.com/"
+                    f"v1beta/models/{current_model}:generateContent"
+                )
+                try:
+                    response = client.post(
+                        gemini_url,
+                        headers={"x-goog-api-key": settings.gemini_api_key},
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    logger.info(
+                        "[%s] Gemini model selected=%s",
+                        trace_id,
+                        current_model,
+                    )
+                    break
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 404:
+                        logger.warning(
+                            "[%s] Gemini model not found: %s. Trying next.",
+                            trace_id,
+                            current_model,
+                        )
+                        continue
+                    raise
+            else:
+                raise RuntimeError("gemini_model_not_found")
     except httpx.TimeoutException as exc:
         logger.exception("[%s] Gemini request timed out", trace_id)
         raise RuntimeError("gemini_timeout") from exc
@@ -303,6 +336,9 @@ def _extract_measurement_from_image(
     except httpx.HTTPError as exc:
         logger.exception("[%s] Gemini transport error", trace_id)
         raise RuntimeError("gemini_transport_error") from exc
+
+    if response is None:
+        raise RuntimeError("gemini_model_not_found")
 
     response_json = response.json()
     candidates = response_json.get("candidates") or []
