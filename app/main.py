@@ -522,6 +522,165 @@ def _read_fixed_row_candidates(
     return candidates
 
 
+SEVEN_SEGMENT_DIGITS: dict[tuple[int, ...], str] = {
+    (1, 1, 1, 0, 1, 1, 1): "0",
+    (0, 0, 1, 0, 0, 1, 0): "1",
+    (1, 0, 1, 1, 1, 0, 1): "2",
+    (1, 0, 1, 1, 0, 1, 1): "3",
+    (0, 1, 1, 1, 0, 1, 0): "4",
+    (1, 1, 0, 1, 0, 1, 1): "5",
+    (1, 1, 0, 1, 1, 1, 1): "6",
+    (1, 0, 1, 0, 0, 1, 0): "7",
+    (1, 1, 1, 1, 1, 1, 1): "8",
+    (1, 1, 1, 1, 0, 1, 1): "9",
+}
+
+
+def _threshold_dark_foreground(
+    image: Image.Image,
+    threshold: int = 150,
+) -> Image.Image:
+    gray = ImageOps.autocontrast(ImageOps.grayscale(image))
+    return gray.point(lambda pixel: 255 if pixel < threshold else 0)
+
+
+def _column_dark_counts(image: Image.Image) -> list[int]:
+    width, height = image.size
+    minimum_pixels = max(1, int(height * 0.08))
+    counts: list[int] = []
+    for x in range(width):
+        histogram = image.crop((x, 0, x + 1, height)).histogram()
+        count = histogram[255] if len(histogram) > 255 else 0
+        counts.append(count if count >= minimum_pixels else 0)
+    return counts
+
+
+def _find_digit_spans(
+    image: Image.Image,
+    expected_digits: int,
+) -> list[tuple[int, int]]:
+    counts = _column_dark_counts(image)
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for x, count in enumerate(counts):
+        if count > 0 and start is None:
+            start = x
+        elif count == 0 and start is not None:
+            if x - start >= 4:
+                spans.append((start, x))
+            start = None
+    if start is not None and len(counts) - start >= 4:
+        spans.append((start, len(counts)))
+
+    if not spans:
+        return []
+
+    merged: list[tuple[int, int]] = [spans[0]]
+    max_gap = max(2, image.size[0] // 40)
+    for start, end in spans[1:]:
+        last_start, last_end = merged[-1]
+        if start - last_end <= max_gap:
+            merged[-1] = (last_start, end)
+        else:
+            merged.append((start, end))
+
+    while len(merged) > expected_digits:
+        gaps = [
+            merged[idx + 1][0] - merged[idx][1]
+            for idx in range(len(merged) - 1)
+        ]
+        if not gaps:
+            break
+        merge_idx = gaps.index(min(gaps))
+        merged[merge_idx] = (merged[merge_idx][0], merged[merge_idx + 1][1])
+        merged.pop(merge_idx + 1)
+
+    return merged
+
+
+def _segment_is_active(
+    image: Image.Image,
+    bounds: tuple[float, float, float, float],
+    threshold: float,
+) -> int:
+    width, height = image.size
+    x0 = max(0, min(width, int(width * bounds[0])))
+    y0 = max(0, min(height, int(height * bounds[1])))
+    x1 = max(x0 + 1, min(width, int(width * bounds[2])))
+    y1 = max(y0 + 1, min(height, int(height * bounds[3])))
+    region = image.crop((x0, y0, x1, y1))
+    histogram = region.histogram()
+    dark_pixels = histogram[255] if len(histogram) > 255 else 0
+    area = max(1, region.size[0] * region.size[1])
+    return 1 if (dark_pixels / area) >= threshold else 0
+
+
+def _recognize_seven_segment_digit(image: Image.Image) -> str | None:
+    bbox = image.getbbox()
+    if bbox is None:
+        return None
+
+    padded = image.crop(bbox).resize((90, 150), Image.Resampling.NEAREST)
+    segments = (
+        _segment_is_active(padded, (0.22, 0.02, 0.78, 0.16), 0.30),
+        _segment_is_active(padded, (0.05, 0.12, 0.24, 0.48), 0.24),
+        _segment_is_active(padded, (0.76, 0.12, 0.95, 0.48), 0.24),
+        _segment_is_active(padded, (0.22, 0.42, 0.78, 0.58), 0.24),
+        _segment_is_active(padded, (0.05, 0.52, 0.24, 0.88), 0.24),
+        _segment_is_active(padded, (0.76, 0.52, 0.95, 0.88), 0.24),
+        _segment_is_active(padded, (0.22, 0.84, 0.78, 0.98), 0.30),
+    )
+
+    if segments in SEVEN_SEGMENT_DIGITS:
+        return SEVEN_SEGMENT_DIGITS[segments]
+
+    # Thin digits like 1 can miss one side segment after thresholding.
+    if segments in ((0, 0, 1, 0, 0, 0, 0), (0, 0, 0, 0, 0, 1, 0)):
+        return "1"
+    return None
+
+
+def _decode_row_with_seven_segments(
+    display_img: Image.Image,
+    row_box: tuple[float, float, float, float],
+    expected_digits: int,
+) -> int | None:
+    width, height = display_img.size
+    crop = display_img.crop(
+        (
+            int(width * row_box[0]),
+            int(height * row_box[1]),
+            int(width * row_box[2]),
+            int(height * row_box[3]),
+        )
+    )
+    if crop.size[0] <= 0 or crop.size[1] <= 0:
+        return None
+
+    threshold_candidates = [110, 130, 150, 170]
+    decoded_values: list[int] = []
+    for threshold in threshold_candidates:
+        binary = _threshold_dark_foreground(crop, threshold)
+        spans = _find_digit_spans(binary, expected_digits)
+        if len(spans) != expected_digits:
+            continue
+
+        digits: list[str] = []
+        for start, end in spans:
+            digit = _recognize_seven_segment_digit(
+                binary.crop((start, 0, end, binary.size[1]))
+            )
+            if digit is None:
+                digits = []
+                break
+            digits.append(digit)
+
+        if len(digits) == expected_digits:
+            decoded_values.append(int("".join(digits)))
+
+    return _pick_stable_value(decoded_values)
+
+
 def _extract_measurements_by_regions(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
@@ -542,6 +701,41 @@ def _extract_measurements_by_regions(
         ),
         Image.Resampling.LANCZOS,
     )
+
+    seven_segment_sys = _decode_row_with_seven_segments(
+        display_img,
+        (0.18, 0.10, 0.82, 0.36),
+        3,
+    )
+    seven_segment_dia = _decode_row_with_seven_segments(
+        display_img,
+        (0.20, 0.34, 0.76, 0.61),
+        2,
+    )
+    seven_segment_pul = _decode_row_with_seven_segments(
+        display_img,
+        (0.31, 0.61, 0.72, 0.88),
+        2,
+    )
+    logger.info(
+        "Seven-segment OCR SYS=%s DIA=%s PUL=%s",
+        seven_segment_sys,
+        seven_segment_dia,
+        seven_segment_pul,
+    )
+    if (
+        seven_segment_sys is not None
+        and seven_segment_dia is not None
+        and seven_segment_pul is not None
+        and seven_segment_sys > seven_segment_dia
+    ):
+        return {
+            "systolic": seven_segment_sys,
+            "diastolic": seven_segment_dia,
+            "pulse": seven_segment_pul,
+            "confidence": 0.99,
+            "notes": "Lectura por reconocimiento de display de 7 segmentos.",
+        }
 
     rows = _collect_display_row_candidates(display_img)
     systolic = _pick_weighted_value(rows["sys"])
