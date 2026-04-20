@@ -391,6 +391,72 @@ def _read_field_candidates(
     return numbers
 
 
+def _pick_best_in_range(candidates: list[int]) -> int | None:
+    if not candidates:
+        return None
+    filtered = [value for value in candidates if 0 < value < 300]
+    if not filtered:
+        return None
+    return _pick_stable_value(filtered)
+
+
+def _extract_measurements_by_omron_layout(
+    image_bytes: bytes,
+) -> dict[str, Any] | None:
+    base = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    width, height = base.size
+    prepared = ImageOps.autocontrast(ImageOps.grayscale(base))
+
+    sys_box = (
+        int(width * 0.28),
+        int(height * 0.22),
+        int(width * 0.67),
+        int(height * 0.41),
+    )
+    dia_box = (
+        int(width * 0.34),
+        int(height * 0.38),
+        int(width * 0.64),
+        int(height * 0.59),
+    )
+    pul_box = (
+        int(width * 0.41),
+        int(height * 0.54),
+        int(width * 0.61),
+        int(height * 0.69),
+    )
+
+    sys_candidates = _read_field_candidates(prepared, sys_box, 70, 250)
+    dia_candidates = _read_field_candidates(prepared, dia_box, 40, 150)
+    pul_candidates = _read_field_candidates(prepared, pul_box, 30, 220)
+
+    logger.info(
+        "Omron layout OCR SYS=%s DIA=%s PUL=%s",
+        sys_candidates[:8],
+        dia_candidates[:8],
+        pul_candidates[:8],
+    )
+
+    systolic = _pick_best_in_range(sys_candidates)
+    diastolic = _pick_best_in_range(dia_candidates)
+    pulse = _pick_best_in_range(pul_candidates)
+    if (
+        systolic is None
+        or diastolic is None
+        or pulse is None
+        or systolic <= diastolic
+    ):
+        return None
+
+    return {
+        "systolic": systolic,
+        "diastolic": diastolic,
+        "pulse": pulse,
+        "confidence": 0.97,
+        "notes": "Lectura OCR local por layout fijo Omron.",
+    }
+
+
 def _collect_display_row_candidates(
     display_img: Image.Image,
 ) -> dict[str, list[tuple[int, float]]]:
@@ -685,6 +751,10 @@ def _decode_row_with_seven_segments(
 def _extract_measurements_by_regions(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
+    direct_layout_data = _extract_measurements_by_omron_layout(image_bytes)
+    if direct_layout_data is not None:
+        return direct_layout_data
+
     base = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     width, height = base.size
 
