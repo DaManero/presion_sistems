@@ -23,6 +23,11 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageEnhance, ImageOps
 
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception:  # noqa: BLE001
+    RapidOCR = None
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -46,9 +51,14 @@ PROCESSING_TIMEOUT_SECONDS = float(
 )
 SHEETS_TIMEOUT_SECONDS = float(os.getenv("SHEETS_TIMEOUT_SECONDS", "30"))
 WEBHOOK_DEDUP_TTL_SECONDS = int(os.getenv("WEBHOOK_DEDUP_TTL_SECONDS", "300"))
+ENABLE_TEXT_FALLBACK = (
+    os.getenv("ENABLE_TEXT_FALLBACK", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 _recent_update_ids: dict[int, float] = {}
 _recent_file_keys: dict[str, float] = {}
+_rapid_ocr_engine: Any | None = None
 
 
 def _cleanup_dedup_cache(now: float) -> None:
@@ -401,6 +411,166 @@ def _pick_best_in_range(candidates: list[int]) -> int | None:
     if not filtered:
         return None
     return _pick_stable_value(filtered)
+
+
+def _get_rapid_ocr_engine() -> Any | None:
+    global _rapid_ocr_engine
+    if RapidOCR is None:
+        return None
+    if _rapid_ocr_engine is None:
+        _rapid_ocr_engine = RapidOCR()
+    return _rapid_ocr_engine
+
+
+def _rapidocr_read_numbers(
+    image: np.ndarray,
+    min_value: int,
+    max_value: int,
+) -> list[int]:
+    engine = _get_rapid_ocr_engine()
+    if engine is None:
+        return []
+
+    candidates: list[int] = []
+    variants = [
+        image,
+        cv2.adaptiveThreshold(
+            image,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            35,
+            7,
+        ),
+        cv2.adaptiveThreshold(
+            image,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            35,
+            7,
+        ),
+    ]
+
+    for variant in variants:
+        result = engine(variant)
+        if not result:
+            continue
+
+        lines = result[0] if isinstance(result, tuple) else result
+        if not lines:
+            continue
+
+        texts: list[str] = []
+        for line in lines:
+            if not isinstance(line, (list, tuple)):
+                continue
+            if len(line) >= 2 and isinstance(line[1], str):
+                texts.append(line[1])
+                continue
+            if len(line) >= 2 and isinstance(line[1], (list, tuple)):
+                maybe_text = line[1][0] if line[1] else ""
+                if isinstance(maybe_text, str):
+                    texts.append(maybe_text)
+
+        raw = " ".join(texts)
+        candidates.extend(_extract_valid_numbers(raw, min_value, max_value))
+
+    return candidates
+
+
+def _extract_measurements_with_rapidocr(
+    image_bytes: bytes,
+) -> dict[str, Any] | None:
+    if RapidOCR is None:
+        return None
+
+    buffer = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape[:2]
+
+    # Direct crop for Omron display area and rows.
+    display = gray[
+        int(height * 0.16):int(height * 0.69),
+        int(width * 0.20):int(width * 0.73),
+    ]
+    if display.size == 0:
+        return None
+
+    display = cv2.resize(
+        display,
+        None,
+        fx=3.0,
+        fy=3.0,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    h, w = display.shape[:2]
+    row_boxes = {
+        "sys": (
+            int(h * 0.14),
+            int(h * 0.40),
+            int(w * 0.18),
+            int(w * 0.76),
+            70,
+            250,
+        ),
+        "dia": (
+            int(h * 0.40),
+            int(h * 0.68),
+            int(w * 0.24),
+            int(w * 0.74),
+            40,
+            150,
+        ),
+        "pul": (
+            int(h * 0.73),
+            int(h * 0.94),
+            int(w * 0.37),
+            int(w * 0.71),
+            30,
+            220,
+        ),
+    }
+
+    candidates: dict[str, list[int]] = {"sys": [], "dia": [], "pul": []}
+    for key, (y0, y1, x0, x1, min_value, max_value) in row_boxes.items():
+        crop = display[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        candidates[key].extend(
+            _rapidocr_read_numbers(crop, min_value, max_value)
+        )
+
+    logger.info(
+        "RapidOCR display SYS=%s DIA=%s PUL=%s",
+        candidates["sys"][:8],
+        candidates["dia"][:8],
+        candidates["pul"][:8],
+    )
+
+    systolic = _pick_best_in_range(candidates["sys"])
+    diastolic = _pick_best_in_range(candidates["dia"])
+    pulse = _pick_best_in_range(candidates["pul"])
+    if (
+        systolic is None
+        or diastolic is None
+        or pulse is None
+        or systolic <= diastolic
+    ):
+        return None
+
+    return {
+        "systolic": systolic,
+        "diastolic": diastolic,
+        "pulse": pulse,
+        "confidence": 0.998,
+        "notes": "Lectura RapidOCR del display Omron.",
+    }
 
 
 def _seven_segment_digit_patterns() -> dict[str, tuple[int, ...]]:
@@ -985,6 +1155,10 @@ def _decode_row_with_seven_segments(
 def _extract_measurements_by_regions(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
+    rapidocr_data = _extract_measurements_with_rapidocr(image_bytes)
+    if rapidocr_data is not None:
+        return rapidocr_data
+
     opencv_data = _extract_measurements_with_opencv(image_bytes)
     if opencv_data is not None:
         return opencv_data
@@ -1442,6 +1616,9 @@ def _extract_measurement_from_image(
             "observacion": regional_data["notes"],
             "estado": "auto",
         }
+
+    if not ENABLE_TEXT_FALLBACK:
+        raise ValueError("ocr_values_not_found")
 
     try:
         text_candidates = _run_ocr_text_candidates(image_bytes)
