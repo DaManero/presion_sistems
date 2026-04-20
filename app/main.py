@@ -327,8 +327,8 @@ def _read_field_candidates(
 ) -> list[int]:
     x0, y0, x1, y1 = box
     width, height = variant.size
-    margin_x = int(width * 0.03)
-    margin_y = int(height * 0.02)
+    margin_x = int(width * 0.015)
+    margin_y = int(height * 0.01)
     crops = [
         (x0, y0, x1, y1),
         (
@@ -341,7 +341,6 @@ def _read_field_candidates(
 
     configs = [
         "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789",
-        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789",
         "--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789",
     ]
 
@@ -350,11 +349,11 @@ def _read_field_candidates(
         crop = variant.crop(crop_box)
         # Upscale and auto-contrast improve readability for segmented digits.
         enlarged = crop.resize(
-            (crop.width * 3, crop.height * 3),
+            (crop.width * 4, crop.height * 4),
             Image.Resampling.LANCZOS,
         )
         prepared = ImageOps.autocontrast(ImageOps.grayscale(enlarged))
-        thresholded = prepared.point(lambda p: 255 if p > 140 else 0)
+        thresholded = prepared.point(lambda p: 255 if p > 150 else 0)
         prepared_variants = [prepared, thresholded]
 
         for prepared_variant in prepared_variants:
@@ -373,30 +372,39 @@ def _read_field_candidates(
 def _extract_measurements_by_regions(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
-    variants = _ocr_image_variants(image_bytes)
+    base = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    # This monitor is centered; keeping original scale preserves digit shape.
+    prepared_variant = ImageOps.autocontrast(ImageOps.grayscale(base))
     region_candidates = {
         "sys": [],
         "dia": [],
         "pul": [],
     }
 
-    for variant in variants:
-        width, height = variant.size
-        x0 = int(width * 0.22)
-        x1 = int(width * 0.86)
-        sys_box = (x0, int(height * 0.04), x1, int(height * 0.36))
-        dia_box = (x0, int(height * 0.31), x1, int(height * 0.64))
-        pul_box = (x0, int(height * 0.58), x1, int(height * 0.94))
+    width, height = prepared_variant.size
+    # Tuned for Omron framing: right display, 3 stacked numeric rows.
+    x0 = int(width * 0.30)
+    x1 = int(width * 0.74)
+    sys_box = (x0, int(height * 0.23), x1, int(height * 0.43))
+    dia_box = (x0, int(height * 0.40), x1, int(height * 0.61))
+    pul_box = (x0, int(height * 0.57), x1, int(height * 0.78))
 
-        region_candidates["sys"].extend(
-            _read_field_candidates(variant, sys_box, 70, 250)
-        )
-        region_candidates["dia"].extend(
-            _read_field_candidates(variant, dia_box, 40, 150)
-        )
-        region_candidates["pul"].extend(
-            _read_field_candidates(variant, pul_box, 30, 220)
-        )
+    region_candidates["sys"].extend(
+        _read_field_candidates(prepared_variant, sys_box, 70, 250)
+    )
+    region_candidates["dia"].extend(
+        _read_field_candidates(prepared_variant, dia_box, 40, 150)
+    )
+    region_candidates["pul"].extend(
+        _read_field_candidates(prepared_variant, pul_box, 30, 220)
+    )
+
+    logger.info(
+        "Regional OCR candidates SYS=%s DIA=%s PUL=%s",
+        region_candidates["sys"][:8],
+        region_candidates["dia"][:8],
+        region_candidates["pul"][:8],
+    )
 
     systolic = _pick_stable_value(region_candidates["sys"])
     diastolic = _pick_stable_value(region_candidates["dia"])
