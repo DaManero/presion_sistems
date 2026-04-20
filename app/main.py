@@ -1,9 +1,9 @@
 import asyncio
-import base64
 import io
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,10 +13,11 @@ from zoneinfo import ZoneInfo
 
 import gspread
 import httpx
+import pytesseract
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 load_dotenv()
 
@@ -25,10 +26,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Presion Bot Backend", version="0.1.0")
 
+TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip()
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
 REQUIRED_ENV_VARS = [
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_WEBHOOK_SECRET",
-    "GEMINI_API_KEY",
     "GOOGLE_SHEETS_ID",
     "GOOGLE_SERVICE_ACCOUNT_JSON",
 ]
@@ -36,7 +40,6 @@ REQUIRED_ENV_VARS = [
 PROCESSING_TIMEOUT_SECONDS = float(
     os.getenv("PROCESSING_TIMEOUT_SECONDS", "600")
 )
-GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "300"))
 SHEETS_TIMEOUT_SECONDS = float(os.getenv("SHEETS_TIMEOUT_SECONDS", "30"))
 
 
@@ -44,7 +47,6 @@ SHEETS_TIMEOUT_SECONDS = float(os.getenv("SHEETS_TIMEOUT_SECONDS", "30"))
 class Settings:
     telegram_bot_token: str
     telegram_webhook_secret: str
-    gemini_api_key: str
     google_sheets_id: str
     google_service_account_json: str
     timezone: str
@@ -72,7 +74,6 @@ def _get_settings() -> Settings:
     return Settings(
         telegram_bot_token=_get_required_env("TELEGRAM_BOT_TOKEN"),
         telegram_webhook_secret=_get_required_env("TELEGRAM_WEBHOOK_SECRET"),
-        gemini_api_key=_get_required_env("GEMINI_API_KEY"),
         google_sheets_id=_get_required_env("GOOGLE_SHEETS_ID"),
         google_service_account_json=_get_required_env(
             "GOOGLE_SERVICE_ACCOUNT_JSON"
@@ -97,17 +98,164 @@ def _get_sheet(settings: Settings):
     return sheet
 
 
-def _clean_json(text: str) -> dict[str, Any]:
-    content = text.strip()
-    if content.startswith("```"):
-        content = content.strip("`")
-        if content.startswith("json"):
-            content = content[4:].strip()
-    start = content.find("{")
-    end = content.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("Gemini response does not contain valid JSON object")
-    return json.loads(content[start:end + 1])
+def _extract_first_number(raw: str, patterns: list[str]) -> int | None:
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _extract_first_float(raw: str, patterns: list[str]) -> float | None:
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _fallback_extract_measurements(raw: str) -> dict[str, Any] | None:
+    systolic = _extract_first_number(
+        raw,
+        [
+            r"(?:systolic|sistolica)\D{0,12}(\d{2,3})",
+        ],
+    )
+    diastolic = _extract_first_number(
+        raw,
+        [
+            r"(?:diastolic|diastolica)\D{0,12}(\d{2,3})",
+        ],
+    )
+    pulse = _extract_first_number(
+        raw,
+        [
+            r"(?:pulse|pulso|heart\s*rate|hr)\D{0,12}(\d{2,3})",
+        ],
+    )
+
+    if systolic is None or diastolic is None:
+        return None
+
+    confidence = _extract_first_float(
+        raw,
+        [
+            r"confidence\D{0,12}([01](?:\.\d+)?)",
+            r"confianza\D{0,12}([01](?:\.\d+)?)",
+        ],
+    )
+
+    return {
+        "systolic": systolic,
+        "diastolic": diastolic,
+        "pulse": pulse,
+        "confidence": confidence,
+        "notes": "Valores recuperados con parseo de respaldo.",
+    }
+
+
+def _extract_triplet_from_numbers(
+    numbers: list[int],
+) -> tuple[int | None, int | None, int | None, float]:
+    best: tuple[int | None, int | None, int | None, float] = (
+        None,
+        None,
+        None,
+        0.0,
+    )
+    for idx in range(max(0, len(numbers) - 2)):
+        s, d, p = numbers[idx], numbers[idx + 1], numbers[idx + 2]
+        if _is_valid_range(s, d, p):
+            score = 0.85
+        elif 70 <= s <= 250 and 40 <= d <= 150:
+            score = 0.55
+        else:
+            score = 0.2
+        if score > best[3]:
+            best = (s, d, p, score)
+    return best
+
+
+def _ocr_image_variants(image_bytes: bytes) -> list[Image.Image]:
+    base_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    large = base_img.resize(
+        (base_img.width * 2, base_img.height * 2),
+        Image.Resampling.LANCZOS,
+    )
+    gray = ImageOps.grayscale(large)
+    contrasted = ImageEnhance.Contrast(gray).enhance(2.2)
+    binary = contrasted.point(lambda p: 255 if p > 145 else 0)
+    return [large, gray, contrasted, binary]
+
+
+def _run_ocr_text_candidates(image_bytes: bytes) -> list[str]:
+    variants = _ocr_image_variants(image_bytes)
+    results: list[str] = []
+    ocr_configs = [
+        "--oem 3 --psm 6",
+        "--oem 3 --psm 11",
+        "--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789.:/SYSDIAPULHR",
+    ]
+    for variant in variants:
+        for config in ocr_configs:
+            text = pytesseract.image_to_string(variant, config=config)
+            if text and text.strip():
+                results.append(text)
+    return results
+
+
+def _extract_measurements_from_ocr_text(raw: str) -> dict[str, Any] | None:
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    if not normalized:
+        return None
+
+    labeled_systolic = _extract_first_number(
+        normalized,
+        [r"(?:sys|systolic|sistolica)\D{0,10}(\d{2,3})"],
+    )
+    labeled_diastolic = _extract_first_number(
+        normalized,
+        [r"(?:dia|diastolic|diastolica)\D{0,10}(\d{2,3})"],
+    )
+    labeled_pulse = _extract_first_number(
+        normalized,
+        [r"(?:pul|pulse|pulso|hr|heart\s*rate)\D{0,10}(\d{2,3})"],
+    )
+
+    if labeled_systolic is not None and labeled_diastolic is not None:
+        confidence = 0.92 if labeled_pulse is not None else 0.82
+        return {
+            "systolic": labeled_systolic,
+            "diastolic": labeled_diastolic,
+            "pulse": labeled_pulse,
+            "confidence": confidence,
+            "notes": "Lectura OCR local por etiquetas.",
+        }
+
+    numbers = [
+        int(match)
+        for match in re.findall(r"\b\d{2,3}\b", normalized)
+    ]
+    if len(numbers) < 3:
+        return None
+
+    systolic, diastolic, pulse, score = _extract_triplet_from_numbers(numbers)
+    if systolic is None or diastolic is None:
+        return None
+
+    return {
+        "systolic": systolic,
+        "diastolic": diastolic,
+        "pulse": pulse,
+        "confidence": score,
+        "notes": "Lectura OCR local por patron numerico.",
+    }
 
 
 def _is_valid_range(systolic: int, diastolic: int, pulse: int) -> bool:
@@ -204,7 +352,7 @@ async def _safe_telegram_send_message(
 
 
 def _optimize_image(image_bytes: bytes) -> bytes:
-    """Compress and optimize image for faster Gemini processing."""
+    """Compress and optimize image for faster OCR processing."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
 
@@ -226,141 +374,43 @@ def _optimize_image(image_bytes: bytes) -> bytes:
 
 
 def _extract_measurement_from_image(
-    settings: Settings,
     image_bytes: bytes,
-    mime_type: str,
     trace_id: str,
 ) -> dict[str, Any]:
     step_start = perf_counter()
-
-    prompt = (
-        "Extract blood pressure values from this image of a pressure monitor. "
-        "Return only JSON with keys: systolic, diastolic, pulse, "
-        "confidence, notes. "
-        "Rules: all values must be integers, confidence from 0 to 1. "
-        "If any value is not readable, set it to null and explain in notes."
-    )
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
-    model_name = model_name.replace("models/", "")
-    fallback_raw = os.getenv(
-        "GEMINI_FALLBACK_MODELS",
-        "gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash-latest",
-    )
-    fallback_models = [
-        m.strip().replace("models/", "")
-        for m in fallback_raw.split(",")
-        if m.strip()
-    ]
-    model_candidates = [model_name, *fallback_models]
-    # Preserve order while deduplicating.
-    model_candidates = list(dict.fromkeys(model_candidates))
-    config_time = perf_counter() - step_start
-    logger.info(f"Gemini request setup in {config_time:.2f}s")
-
-    step_start = perf_counter()
     logger.info(
-        "[%s] Sending image to Gemini REST API (models=%s size=%s bytes)",
+        "[%s] Starting local OCR (size=%s bytes)",
         trace_id,
-        model_candidates,
         len(image_bytes),
     )
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "inlineData": {
-                            "mimeType": mime_type,
-                            "data": base64.b64encode(image_bytes).decode(
-                                "ascii"
-                            ),
-                        }
-                    },
-                    {"text": prompt},
-                ]
-            }
-        ],
-        "generationConfig": {"responseMimeType": "application/json"},
-    }
 
-    timeout = httpx.Timeout(
-        connect=min(15.0, GEMINI_TIMEOUT_SECONDS),
-        read=GEMINI_TIMEOUT_SECONDS,
-        write=min(30.0, GEMINI_TIMEOUT_SECONDS),
-        pool=min(15.0, GEMINI_TIMEOUT_SECONDS),
-    )
-    response = None
     try:
-        with httpx.Client(timeout=timeout) as client:
-            for current_model in model_candidates:
-                gemini_url = (
-                    "https://generativelanguage.googleapis.com/"
-                    f"v1beta/models/{current_model}:generateContent"
-                )
-                try:
-                    response = client.post(
-                        gemini_url,
-                        headers={"x-goog-api-key": settings.gemini_api_key},
-                        json=payload,
-                    )
-                    response.raise_for_status()
-                    logger.info(
-                        "[%s] Gemini model selected=%s",
-                        trace_id,
-                        current_model,
-                    )
-                    break
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 404:
-                        logger.warning(
-                            "[%s] Gemini model not found: %s. Trying next.",
-                            trace_id,
-                            current_model,
-                        )
-                        continue
-                    raise
-            else:
-                raise RuntimeError("gemini_model_not_found")
-    except httpx.TimeoutException as exc:
-        logger.exception("[%s] Gemini request timed out", trace_id)
-        raise RuntimeError("gemini_timeout") from exc
-    except httpx.HTTPStatusError as exc:
-        body_preview = exc.response.text[:600]
-        logger.error(
-            "[%s] Gemini HTTP error status=%s body=%s",
-            trace_id,
-            exc.response.status_code,
-            body_preview,
-        )
-        if exc.response.status_code == 429:
-            raise RuntimeError("gemini_quota_exceeded") from exc
-        raise RuntimeError("gemini_http_error") from exc
-    except httpx.HTTPError as exc:
-        logger.exception("[%s] Gemini transport error", trace_id)
-        raise RuntimeError("gemini_transport_error") from exc
+        text_candidates = _run_ocr_text_candidates(image_bytes)
+    except pytesseract.TesseractNotFoundError as exc:
+        logger.exception("[%s] Local OCR engine not found", trace_id)
+        raise RuntimeError("ocr_engine_not_found") from exc
+    except Exception as exc:
+        logger.exception("[%s] Local OCR failed", trace_id)
+        raise RuntimeError("ocr_local_error") from exc
 
-    if response is None:
-        raise RuntimeError("gemini_model_not_found")
-
-    response_json = response.json()
-    candidates = response_json.get("candidates") or []
-    if not candidates:
-        raise ValueError("Gemini response missing candidates")
-    parts = (candidates[0].get("content") or {}).get("parts") or []
-    if not parts:
-        raise ValueError("Gemini response missing content parts")
-    raw = parts[0].get("text") or ""
-    if not raw:
-        raise ValueError("Gemini response missing text payload")
-
-    gemini_time = perf_counter() - step_start
+    ocr_time = perf_counter() - step_start
     logger.info(
-        "[%s] Gemini response received in %.2fs",
+        "[%s] OCR completed in %.2fs (candidates=%s)",
         trace_id,
-        gemini_time,
+        ocr_time,
+        len(text_candidates),
     )
 
-    parsed = _clean_json(raw)
+    parsed = None
+    for raw_text in text_candidates:
+        parsed = _extract_measurements_from_ocr_text(raw_text)
+        if parsed:
+            break
+
+    if parsed is None and text_candidates:
+        parsed = _fallback_extract_measurements("\n".join(text_candidates))
+    if parsed is None:
+        raise ValueError("ocr_values_not_found")
 
     systolic = parsed.get("systolic")
     diastolic = parsed.get("diastolic")
@@ -453,15 +503,13 @@ async def _process_telegram_photo(
         data = await asyncio.wait_for(
             asyncio.to_thread(
                 _extract_measurement_from_image,
-                settings,
                 optimized_bytes,
-                "image/jpeg",
                 trace_id,
             ),
             timeout=PROCESSING_TIMEOUT_SECONDS,
         )
         logger.info(
-            "[%s] Gemini extraction completed for chat_id=%s",
+            "[%s] OCR extraction completed for chat_id=%s",
             trace_id,
             chat_id,
         )
@@ -535,19 +583,24 @@ async def _process_telegram_photo(
             file_id,
             elapsed,
         )
-        # If Gemini fails, communicate that explicitly to speed up diagnosis.
+        # If local OCR fails, communicate that clearly for diagnosis.
         error_text = (
             "Hubo un error al procesar la imagen. "
             "Intenta de nuevo con una foto mas clara."
         )
-        if str(exc) == "gemini_quota_exceeded":
+        if str(exc) == "ocr_engine_not_found":
             error_text = (
-                "Gemini llego al limite de cuota del plan actual. "
-                "Intenta mas tarde o habilita facturacion en Google AI."
+                "El motor OCR local no esta disponible en el servidor. "
+                "Contactame para habilitarlo."
             )
-        elif isinstance(exc, RuntimeError) and str(exc).startswith("gemini_"):
+        elif str(exc) == "ocr_values_not_found":
             error_text = (
-                "No pude conectar con Gemini en este momento. "
+                "No pude leer valores claros en la foto. "
+                "Intenta con mejor luz, sin reflejos y bien enfocada."
+            )
+        elif isinstance(exc, RuntimeError) and str(exc).startswith("ocr_"):
+            error_text = (
+                "Hubo un problema con el OCR local en este momento. "
                 "Intenta de nuevo en unos minutos."
             )
         await _safe_telegram_send_message(

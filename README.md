@@ -1,4 +1,4 @@
-# Proyecto Personal: Registro de Presion Arterial con Telegram + Gemini + Google Sheets
+# Proyecto Personal: Registro de Presion Arterial con Telegram + OCR Local + Google Sheets
 
 ## Objetivo
 
@@ -18,7 +18,7 @@ Automatizar el registro diario de mediciones de presion arterial a partir de una
 3. Envias la foto al bot de Telegram.
 4. Telegram envia el evento al webhook desplegado en Railway.
 5. El backend descarga la imagen desde Telegram.
-6. Gemini extrae los datos de la foto en formato estructurado.
+6. Un OCR local extrae los datos de la foto en formato estructurado.
 7. El backend valida los valores y registra una nueva fila en Google Sheets con fecha y hora.
 8. El bot responde por Telegram confirmando el guardado.
 
@@ -40,7 +40,7 @@ Columnas recomendadas:
 
 - Backend: Python + FastAPI
 - Mensajeria: Telegram Bot API (webhook)
-- IA OCR/Extraccion: Google Gemini API
+- IA OCR/Extraccion: OCR local (Tesseract)
 - Persistencia: Google Sheets API
 - Hosting: Railway
 
@@ -50,16 +50,14 @@ Definir en Railway:
 
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_WEBHOOK_SECRET
-- GEMINI_API_KEY
 - GOOGLE_SHEETS_ID
 - GOOGLE_SERVICE_ACCOUNT_JSON
 - TZ=America/Argentina/Buenos_Aires
 
 Opcionales (recomendado):
 
-- GEMINI_MODEL=gemini-1.5-flash
+- TESSERACT_CMD=/usr/bin/tesseract (si el binario no esta en PATH)
 - PROCESSING_TIMEOUT_SECONDS=150
-- GEMINI_TIMEOUT_SECONDS=90
 - SHEETS_TIMEOUT_SECONDS=30
 
 Notas:
@@ -98,7 +96,7 @@ Complejidad general: media.
 Motivo:
 
 - La logica de negocio es simple.
-- La complejidad real esta en integrar y estabilizar 4 servicios (Telegram, Gemini, Sheets y Railway).
+- La complejidad real esta en integrar y estabilizar 3 servicios (Telegram, OCR local y Sheets) + dependencias de sistema.
 
 ## Estimacion de tiempos
 
@@ -112,7 +110,7 @@ Motivo:
 2. Crear Google Sheet y service account.
 3. Implementar backend FastAPI con endpoint de salud y webhook.
 4. Integrar descarga de imagen desde Telegram.
-5. Integrar Gemini para extraer JSON estricto.
+5. Integrar OCR local para extraer valores del tensiometro.
 6. Integrar escritura en Google Sheets.
 7. Desplegar en Railway y configurar variables.
 8. Registrar webhook de Telegram contra URL de Railway.
@@ -129,6 +127,8 @@ Motivo:
 
 - Lectura OCR incorrecta por calidad de foto:
   - Mitigacion: prompt estricto, validaciones, confirmacion manual cuando la confianza sea baja.
+- Falta del binario de Tesseract en el servidor:
+  - Mitigacion: instalar Tesseract en el entorno de despliegue y validar en startup.
 - Errores de permisos en Sheets:
   - Mitigacion: compartir hoja con service account y probar con insercion manual inicial.
 - Webhook no llega por mala configuracion:
@@ -136,7 +136,7 @@ Motivo:
 
 ## Entregable final esperado
 
-Un servicio desplegado en Railway (sin frontend) que reciba fotos desde Telegram, extraiga datos de presion arterial con Gemini y registre automaticamente cada medicion en Google Sheets con fecha y hora.
+Un servicio desplegado en Railway (sin frontend) que reciba fotos desde Telegram, extraiga datos de presion arterial con OCR local y registre automaticamente cada medicion en Google Sheets con fecha y hora.
 
 ## Estado actual
 
@@ -210,4 +210,4 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
 
 ## Nota tecnica importante
 
-Actualmente el codigo usa modelo `gemini-1.5-flash`. Si tu cuenta/proyecto de Gemini requiere otro modelo disponible, solo cambia el nombre del modelo en `app/main.py`.
+El proyecto usa OCR local con Tesseract a traves de `pytesseract`. En el entorno de despliegue debe estar instalado el binario de Tesseract para que el OCR funcione.
