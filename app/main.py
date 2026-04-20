@@ -1704,6 +1704,95 @@ def _append_row(
     sheet.append_row(row, value_input_option="USER_ENTERED")
 
 
+def _parse_manual_measurement_text(
+    raw_text: str,
+) -> tuple[int, int, int] | None:
+    text = raw_text.strip()
+
+    sys_value = _extract_first_number(
+        text,
+        [r"(?:sys|systolic|sistolica)\D{0,8}(\d{2,3})"],
+    )
+    dia_value = _extract_first_number(
+        text,
+        [r"(?:dia|diastolic|diastolica)\D{0,8}(\d{2,3})"],
+    )
+    pul_value = _extract_first_number(
+        text,
+        [r"(?:pul|pulse|pulso|hr)\D{0,8}(\d{2,3})"],
+    )
+    if (
+        sys_value is not None
+        and dia_value is not None
+        and pul_value is not None
+    ):
+        return (sys_value, dia_value, pul_value)
+
+    numbers = [
+        int(match)
+        for match in re.findall(r"\b\d{2,3}\b", text)
+    ]
+    if len(numbers) < 3:
+        return None
+
+    for idx in range(max(0, len(numbers) - 2)):
+        s, d, p = numbers[idx], numbers[idx + 1], numbers[idx + 2]
+        if _is_valid_range(s, d, p):
+            return (s, d, p)
+
+    s, d, p = numbers[0], numbers[1], numbers[2]
+    if 70 <= s <= 250 and 40 <= d <= 150 and 30 <= p <= 220:
+        return (s, d, p)
+    return None
+
+
+async def _process_telegram_manual_text(
+    settings: Settings,
+    chat_id: int,
+    text: str,
+    update_id: int | None,
+) -> None:
+    parsed = _parse_manual_measurement_text(text)
+    if parsed is None:
+        await _safe_telegram_send_message(
+            settings,
+            chat_id,
+            "No pude interpretar los valores. "
+            "Envia: SYS/DIA/PUL, por ejemplo 119/87/66.",
+        )
+        return
+
+    systolic, diastolic, pulse = parsed
+    status = (
+        "auto"
+        if _is_valid_range(systolic, diastolic, pulse)
+        else "pendiente_revision"
+    )
+    data = {
+        "sistolica": systolic,
+        "diastolica": diastolic,
+        "pulso": pulse,
+        "confianza_ia": 1.0,
+        "observacion": "Carga manual por Telegram.",
+        "estado": status,
+    }
+
+    manual_id = (
+        f"manual:{update_id}"
+        if update_id is not None
+        else f"manual:{uuid.uuid4().hex[:8]}"
+    )
+    await asyncio.wait_for(
+        asyncio.to_thread(_append_row, settings, data, manual_id),
+        timeout=SHEETS_TIMEOUT_SECONDS,
+    )
+    await _safe_telegram_send_message(
+        settings,
+        chat_id,
+        f"Guardado manual: {systolic}/{diastolic} mmHg, pulso {pulse}",
+    )
+
+
 async def _process_telegram_photo(
     settings: Settings,
     chat_id: int,
@@ -1890,55 +1979,46 @@ async def telegram_webhook(
     if not chat_id:
         return JSONResponse({"ok": True, "ignored": "missing chat id"})
 
+    text = (message.get("text") or "").strip()
+    if text:
+        text_key = f"text:{chat_id}:{update_id}"
+        if _mark_if_duplicate(update_id, text_key):
+            logger.info(
+                "Ignoring duplicated Telegram text update_id=%s",
+                update_id,
+            )
+            return JSONResponse({"ok": True, "ignored": "duplicate text"})
+
+        task = asyncio.create_task(
+            _process_telegram_manual_text(
+                settings,
+                chat_id,
+                text,
+                update_id,
+            )
+        )
+        task.add_done_callback(_log_background_task_result)
+        return JSONResponse({"ok": True, "queued": "manual text"})
+
     photos = message.get("photo") or []
-    if not photos:
-        # Send error message as background task to not block webhook response
+    if photos:
         task = asyncio.create_task(
             _telegram_send_message(
                 settings,
                 chat_id,
-                "No detecte una foto. Enviame una imagen del tensiometro.",
+                "Modo manual activo. "
+                "Envia los valores como SYS/DIA/PUL, por ejemplo 119/87/66.",
             )
         )
         task.add_done_callback(_log_background_task_result)
-        return JSONResponse({"ok": True, "ignored": "no photo"})
+        return JSONResponse({"ok": True, "ignored": "photo in manual mode"})
 
-    # Telegram sends multiple sizes. The last one is typically the largest.
-    best_photo = photos[-1]
-    file_id = best_photo.get("file_id")
-    if not file_id:
-        # Send error message as background task to not block webhook response
-        task = asyncio.create_task(
-            _telegram_send_message(
-                settings,
-                chat_id,
-                "No pude obtener el archivo de la foto.",
-            )
-        )
-        task.add_done_callback(_log_background_task_result)
-        return JSONResponse({"ok": True, "ignored": "missing file id"})
-
-    file_key = f"{chat_id}:{file_id}"
-    if _mark_if_duplicate(update_id, file_key):
-        logger.info(
-            "Ignoring duplicated Telegram update_id=%s file_key=%s",
-            update_id,
-            file_key,
-        )
-        return JSONResponse({"ok": True, "ignored": "duplicate update"})
-
-    # Send immediate confirmation message
-    confirmation_task = asyncio.create_task(
+    task = asyncio.create_task(
         _telegram_send_message(
             settings,
             chat_id,
-            "📷 Foto recibida. Procesando...",
+            "Envia tus datos en formato SYS/DIA/PUL, por ejemplo 119/87/66.",
         )
     )
-    confirmation_task.add_done_callback(_log_background_task_result)
-
-    task = asyncio.create_task(
-        _process_telegram_photo(settings, chat_id, file_id)
-    )
     task.add_done_callback(_log_background_task_result)
-    return JSONResponse({"ok": True, "queued": True})
+    return JSONResponse({"ok": True, "ignored": "no text"})
