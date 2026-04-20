@@ -462,10 +462,11 @@ def _read_fixed_row_candidates(
     row_range: tuple[float, float],
     min_value: int,
     max_value: int,
+    x_range: tuple[float, float] = (0.16, 0.92),
 ) -> list[tuple[int, float]]:
     width, height = display_img.size
-    x0 = int(width * 0.16)
-    x1 = int(width * 0.92)
+    x0 = int(width * x_range[0])
+    x1 = int(width * x_range[1])
     y0 = int(height * row_range[0])
     y1 = int(height * row_range[1])
     if x1 <= x0 or y1 <= y0:
@@ -767,18 +768,21 @@ def _extract_measurements_by_regions(
         (0.12, 0.42),
         70,
         250,
+        (0.18, 0.78),
     )
     fixed_row_dia = _read_fixed_row_candidates(
         display_img,
-        (0.38, 0.70),
+        (0.34, 0.68),
         40,
         150,
+        (0.24, 0.70),
     )
     fixed_row_pul = _read_fixed_row_candidates(
         display_img,
-        (0.72, 0.95),
+        (0.66, 0.92),
         30,
         220,
+        (0.42, 0.74),
     )
     logger.info(
         "Fixed-row OCR candidates SYS=%s DIA=%s PUL=%s",
@@ -819,14 +823,22 @@ def _extract_measurements_by_regions(
     prepared_variant = ImageOps.autocontrast(ImageOps.grayscale(base))
     width, height = prepared_variant.size
     # Tuned for Omron framing: right display, 3 stacked numeric rows.
-    x0 = int(width * 0.25)
-    x1 = int(width * 0.69)
-    sys_box = (x0, int(height * 0.24), x1, int(height * 0.40))
-    dia_box = (x0, int(height * 0.40), x1, int(height * 0.57))
+    sys_box = (
+        int(width * 0.24),
+        int(height * 0.23),
+        int(width * 0.67),
+        int(height * 0.40),
+    )
+    dia_box = (
+        int(width * 0.26),
+        int(height * 0.39),
+        int(width * 0.66),
+        int(height * 0.57),
+    )
     pul_box = (
-        int(width * 0.33),
-        int(height * 0.58),
-        int(width * 0.63),
+        int(width * 0.38),
+        int(height * 0.61),
+        int(width * 0.58),
         int(height * 0.71),
     )
 
