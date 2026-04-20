@@ -12,8 +12,10 @@ from time import perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import cv2
 import gspread
 import httpx
+import numpy as np
 import pytesseract
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -400,6 +402,101 @@ def _pick_best_in_range(candidates: list[int]) -> int | None:
     return _pick_stable_value(filtered)
 
 
+def _extract_measurements_with_opencv(
+    image_bytes: bytes,
+) -> dict[str, Any] | None:
+    buffer = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape[:2]
+    display = gray[
+        int(height * 0.16):int(height * 0.69),
+        int(width * 0.20):int(width * 0.73),
+    ]
+    if display.size == 0:
+        return None
+
+    display = cv2.resize(
+        display,
+        None,
+        fx=3.0,
+        fy=3.0,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    enhanced = clahe.apply(display)
+    blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
+
+    _, otsu_binary = cv2.threshold(
+        blurred,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    adaptive_binary = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        41,
+        9,
+    )
+    morph_kernel = np.ones((3, 3), np.uint8)
+    threshold_variants = [
+        otsu_binary,
+        adaptive_binary,
+        cv2.morphologyEx(otsu_binary, cv2.MORPH_CLOSE, morph_kernel),
+        cv2.morphologyEx(adaptive_binary, cv2.MORPH_CLOSE, morph_kernel),
+    ]
+
+    row_boxes = {
+        "sys": ((0.18, 0.14, 0.76, 0.40), 3, 70, 250),
+        "dia": ((0.24, 0.40, 0.74, 0.68), 2, 40, 150),
+        "pul": ((0.37, 0.73, 0.71, 0.94), 2, 30, 220),
+    }
+    candidates: dict[str, list[int]] = {"sys": [], "dia": [], "pul": []}
+
+    for threshold_variant in threshold_variants:
+        pil_variant = Image.fromarray(threshold_variant)
+        for key, (row_box, digits, min_value, max_value) in row_boxes.items():
+            value = _decode_row_with_seven_segments(
+                pil_variant,
+                row_box,
+                digits,
+            )
+            if value is not None and min_value <= value <= max_value:
+                candidates[key].append(value)
+
+    logger.info(
+        "OpenCV display OCR SYS=%s DIA=%s PUL=%s",
+        candidates["sys"][:8],
+        candidates["dia"][:8],
+        candidates["pul"][:8],
+    )
+
+    systolic = _pick_best_in_range(candidates["sys"])
+    diastolic = _pick_best_in_range(candidates["dia"])
+    pulse = _pick_best_in_range(candidates["pul"])
+    if (
+        systolic is None
+        or diastolic is None
+        or pulse is None
+        or systolic <= diastolic
+    ):
+        return None
+
+    return {
+        "systolic": systolic,
+        "diastolic": diastolic,
+        "pulse": pulse,
+        "confidence": 0.995,
+        "notes": "Lectura OpenCV del display Omron.",
+    }
+
+
 def _extract_measurements_by_omron_layout(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
@@ -751,6 +848,10 @@ def _decode_row_with_seven_segments(
 def _extract_measurements_by_regions(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
+    opencv_data = _extract_measurements_with_opencv(image_bytes)
+    if opencv_data is not None:
+        return opencv_data
+
     direct_layout_data = _extract_measurements_by_omron_layout(image_bytes)
     if direct_layout_data is not None:
         return direct_layout_data
