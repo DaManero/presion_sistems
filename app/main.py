@@ -687,12 +687,12 @@ def _extract_measurements_by_regions(
     base = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     width, height = base.size
 
-    # Main display window for Omron framing.
+    # Main LCD window tuned to the Omron photo framing used by the bot.
     display_box = (
-        int(width * 0.24),
-        int(height * 0.17),
-        int(width * 0.82),
-        int(height * 0.80),
+        int(width * 0.20),
+        int(height * 0.16),
+        int(width * 0.73),
+        int(height * 0.69),
     )
     display_img = base.crop(display_box).resize(
         (
@@ -704,17 +704,17 @@ def _extract_measurements_by_regions(
 
     seven_segment_sys = _decode_row_with_seven_segments(
         display_img,
-        (0.18, 0.10, 0.82, 0.36),
+        (0.18, 0.14, 0.76, 0.40),
         3,
     )
     seven_segment_dia = _decode_row_with_seven_segments(
         display_img,
-        (0.20, 0.34, 0.76, 0.61),
+        (0.24, 0.40, 0.74, 0.68),
         2,
     )
     seven_segment_pul = _decode_row_with_seven_segments(
         display_img,
-        (0.31, 0.61, 0.72, 0.88),
+        (0.37, 0.73, 0.71, 0.94),
         2,
     )
     logger.info(
@@ -764,19 +764,19 @@ def _extract_measurements_by_regions(
 
     fixed_row_sys = _read_fixed_row_candidates(
         display_img,
-        (0.08, 0.38),
+        (0.12, 0.42),
         70,
         250,
     )
     fixed_row_dia = _read_fixed_row_candidates(
         display_img,
-        (0.34, 0.64),
+        (0.38, 0.70),
         40,
         150,
     )
     fixed_row_pul = _read_fixed_row_candidates(
         display_img,
-        (0.62, 0.94),
+        (0.72, 0.95),
         30,
         220,
     )
@@ -819,11 +819,16 @@ def _extract_measurements_by_regions(
     prepared_variant = ImageOps.autocontrast(ImageOps.grayscale(base))
     width, height = prepared_variant.size
     # Tuned for Omron framing: right display, 3 stacked numeric rows.
-    x0 = int(width * 0.30)
-    x1 = int(width * 0.74)
-    sys_box = (x0, int(height * 0.23), x1, int(height * 0.43))
-    dia_box = (x0, int(height * 0.40), x1, int(height * 0.61))
-    pul_box = (x0, int(height * 0.57), x1, int(height * 0.78))
+    x0 = int(width * 0.25)
+    x1 = int(width * 0.69)
+    sys_box = (x0, int(height * 0.24), x1, int(height * 0.40))
+    dia_box = (x0, int(height * 0.40), x1, int(height * 0.57))
+    pul_box = (
+        int(width * 0.33),
+        int(height * 0.58),
+        int(width * 0.63),
+        int(height * 0.71),
+    )
 
     region_candidates["sys"].extend(
         _read_field_candidates(prepared_variant, sys_box, 70, 250)
