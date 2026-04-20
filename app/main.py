@@ -158,12 +158,19 @@ async def _telegram_send_message(
         f"https://api.telegram.org/bot{settings.telegram_bot_token}"
     )
     payload = {"chat_id": chat_id, "text": text}
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{telegram_api_base}/sendMessage",
-            json=payload,
-        )
-        resp.raise_for_status()
+    try:
+        logger.info(f"Sending Telegram message to chat_id={chat_id}: {text[:50]}...")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{telegram_api_base}/sendMessage",
+                json=payload,
+                timeout=30,
+            )
+            resp.raise_for_status()
+        logger.info(f"Message sent successfully to chat_id={chat_id}")
+    except Exception as e:
+        logger.error(f"Failed to send Telegram message to chat_id={chat_id}: {e}")
+        raise
 
 
 def _optimize_image(image_bytes: bytes) -> bytes:
@@ -421,23 +428,41 @@ async def telegram_webhook(
 
     photos = message.get("photo") or []
     if not photos:
-        await _telegram_send_message(
-            settings,
-            chat_id,
-            "No detecte una foto. Enviame una imagen del tensiometro.",
+        # Send error message as background task to not block webhook response
+        task = asyncio.create_task(
+            _telegram_send_message(
+                settings,
+                chat_id,
+                "No detecte una foto. Enviame una imagen del tensiometro.",
+            )
         )
+        task.add_done_callback(_log_background_task_result)
         return JSONResponse({"ok": True, "ignored": "no photo"})
 
     # Telegram sends multiple sizes. The last one is typically the largest.
     best_photo = photos[-1]
     file_id = best_photo.get("file_id")
     if not file_id:
-        await _telegram_send_message(
+        # Send error message as background task to not block webhook response
+        task = asyncio.create_task(
+            _telegram_send_message(
+                settings,
+                chat_id,
+                "No pude obtener el archivo de la foto.",
+            )
+        )
+        task.add_done_callback(_log_background_task_result)
+        return JSONResponse({"ok": True, "ignored": "missing file id"})
+
+    # Send immediate confirmation message
+    confirmation_task = asyncio.create_task(
+        _telegram_send_message(
             settings,
             chat_id,
-            "No pude obtener el archivo de la foto.",
+            "📷 Foto recibida. Procesando...",
         )
-        return JSONResponse({"ok": True, "ignored": "missing file id"})
+    )
+    confirmation_task.add_done_callback(_log_background_task_result)
 
     task = asyncio.create_task(
         _process_telegram_photo(settings, chat_id, file_id)
