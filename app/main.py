@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -15,7 +16,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from PIL import Image
-import google.generativeai as genai
 
 load_dotenv()
 
@@ -53,7 +53,14 @@ def _get_required_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
-    return value
+    # Railway env values may include accidental wrapping quotes or spaces.
+    cleaned = value.strip()
+    if (
+        (cleaned.startswith('"') and cleaned.endswith('"'))
+        or (cleaned.startswith("'") and cleaned.endswith("'"))
+    ) and len(cleaned) >= 2:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
 
 
 def _get_missing_env_vars() -> list[str]:
@@ -159,7 +166,11 @@ async def _telegram_send_message(
     )
     payload = {"chat_id": chat_id, "text": text}
     try:
-        logger.info(f"Sending Telegram message to chat_id={chat_id}: {text[:50]}...")
+        logger.info(
+            "Sending Telegram message to chat_id=%s: %s...",
+            chat_id,
+            text[:50],
+        )
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{telegram_api_base}/sendMessage",
@@ -169,7 +180,11 @@ async def _telegram_send_message(
             resp.raise_for_status()
         logger.info(f"Message sent successfully to chat_id={chat_id}")
     except Exception as e:
-        logger.error(f"Failed to send Telegram message to chat_id={chat_id}: {e}")
+        logger.error(
+            "Failed to send Telegram message to chat_id=%s: %s",
+            chat_id,
+            e,
+        )
         raise
 
 
@@ -177,15 +192,15 @@ def _optimize_image(image_bytes: bytes) -> bytes:
     """Compress and optimize image for faster Gemini processing."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        
+
         # Resize if image is too large (max 1920px on longest side)
         max_size = 1920
         img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        
+
         # Convert to RGB if necessary
         if img.mode != "RGB":
             img = img.convert("RGB")
-        
+
         # Compress and save
         output = io.BytesIO()
         img.save(output, format="JPEG", quality=85, optimize=True)
@@ -201,7 +216,7 @@ def _extract_measurement_from_image(
     mime_type: str,
 ) -> dict[str, Any]:
     step_start = perf_counter()
-    
+
     prompt = (
         "Extract blood pressure values from this image of a pressure monitor. "
         "Return only JSON with keys: systolic, diastolic, pulse, "
@@ -209,32 +224,61 @@ def _extract_measurement_from_image(
         "Rules: all values must be integers, confidence from 0 to 1. "
         "If any value is not readable, set it to null and explain in notes."
     )
-    logger.info("Configuring Gemini API")
-    genai.configure(api_key=settings.gemini_api_key)
-    config_time = perf_counter() - step_start
-    logger.info(f"Gemini API configured in {config_time:.2f}s")
-    
     model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-    logger.info(f"Creating Gemini model: {model_name}")
-    gemini_model = genai.GenerativeModel(model_name)
-    
+    config_time = perf_counter() - step_start
+    logger.info(f"Gemini request setup in {config_time:.2f}s")
+
     step_start = perf_counter()
-    logger.info(f"Sending image to Gemini (size={len(image_bytes)} bytes)")
-    response = gemini_model.generate_content(
-        [
-            {
-                "mime_type": mime_type,
-                "data": image_bytes,
-            },
-            prompt,
-        ],
-        generation_config={"response_mime_type": "application/json"},
-        request_options={"timeout": GEMINI_TIMEOUT_SECONDS},
+    logger.info(
+        "Sending image to Gemini REST API (model=%s size=%s bytes)",
+        model_name,
+        len(image_bytes),
     )
+    gemini_url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent"
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64.b64encode(image_bytes).decode(
+                                "ascii"
+                            ),
+                        }
+                    },
+                    {"text": prompt},
+                ]
+            }
+        ],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+
+    with httpx.Client(timeout=GEMINI_TIMEOUT_SECONDS) as client:
+        response = client.post(
+            gemini_url,
+            params={"key": settings.gemini_api_key},
+            json=payload,
+        )
+        response.raise_for_status()
+
+    response_json = response.json()
+    candidates = response_json.get("candidates") or []
+    if not candidates:
+        raise ValueError("Gemini response missing candidates")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    if not parts:
+        raise ValueError("Gemini response missing content parts")
+    raw = parts[0].get("text") or ""
+    if not raw:
+        raise ValueError("Gemini response missing text payload")
+
     gemini_time = perf_counter() - step_start
     logger.info(f"Gemini response received in {gemini_time:.2f}s")
-    
-    raw = response.text or ""
+
     parsed = _clean_json(raw)
 
     systolic = parsed.get("systolic")
@@ -301,7 +345,6 @@ async def _process_telegram_photo(
     )
     try:
         file_path = await _telegram_get_file_path(settings, file_id)
-        mime_type = _guess_mime_type(file_path)
 
         image_bytes = await _telegram_download_file(settings, file_path)
         logger.info(
