@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
@@ -287,6 +288,134 @@ def _ocr_from_monitor_regions(variant: Image.Image) -> dict[str, int | None]:
     }
 
 
+def _normalize_ocr_text_for_digits(raw: str) -> str:
+    return (
+        raw.replace("O", "0")
+        .replace("o", "0")
+        .replace("I", "1")
+        .replace("l", "1")
+        .replace("S", "5")
+        .replace("B", "8")
+    )
+
+
+def _extract_valid_numbers(
+    raw: str,
+    min_value: int,
+    max_value: int,
+) -> list[int]:
+    cleaned = _normalize_ocr_text_for_digits(raw)
+    numbers = [int(n) for n in re.findall(r"\b\d{2,3}\b", cleaned)]
+    return [n for n in numbers if min_value <= n <= max_value]
+
+
+def _pick_stable_value(candidates: list[int]) -> int | None:
+    if not candidates:
+        return None
+    counts = Counter(candidates)
+    most_common = counts.most_common()
+    top_freq = most_common[0][1]
+    top_values = [value for value, freq in most_common if freq == top_freq]
+    return max(top_values)
+
+
+def _read_field_candidates(
+    variant: Image.Image,
+    box: tuple[int, int, int, int],
+    min_value: int,
+    max_value: int,
+) -> list[int]:
+    x0, y0, x1, y1 = box
+    width, height = variant.size
+    margin_x = int(width * 0.03)
+    margin_y = int(height * 0.02)
+    crops = [
+        (x0, y0, x1, y1),
+        (
+            max(0, x0 - margin_x),
+            max(0, y0 - margin_y),
+            min(width, x1 + margin_x),
+            min(height, y1 + margin_y),
+        ),
+    ]
+
+    configs = [
+        "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789",
+        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789",
+        "--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789",
+    ]
+
+    numbers: list[int] = []
+    for crop_box in crops:
+        crop = variant.crop(crop_box)
+        # Upscale and auto-contrast improve readability for segmented digits.
+        enlarged = crop.resize(
+            (crop.width * 3, crop.height * 3),
+            Image.Resampling.LANCZOS,
+        )
+        prepared = ImageOps.autocontrast(ImageOps.grayscale(enlarged))
+        thresholded = prepared.point(lambda p: 255 if p > 140 else 0)
+        prepared_variants = [prepared, thresholded]
+
+        for prepared_variant in prepared_variants:
+            for config in configs:
+                text = pytesseract.image_to_string(
+                    prepared_variant,
+                    config=config,
+                )
+                numbers.extend(
+                    _extract_valid_numbers(text, min_value, max_value)
+                )
+
+    return numbers
+
+
+def _extract_measurements_by_regions(
+    image_bytes: bytes,
+) -> dict[str, Any] | None:
+    variants = _ocr_image_variants(image_bytes)
+    region_candidates = {
+        "sys": [],
+        "dia": [],
+        "pul": [],
+    }
+
+    for variant in variants:
+        width, height = variant.size
+        x0 = int(width * 0.22)
+        x1 = int(width * 0.86)
+        sys_box = (x0, int(height * 0.04), x1, int(height * 0.36))
+        dia_box = (x0, int(height * 0.31), x1, int(height * 0.64))
+        pul_box = (x0, int(height * 0.58), x1, int(height * 0.94))
+
+        region_candidates["sys"].extend(
+            _read_field_candidates(variant, sys_box, 70, 250)
+        )
+        region_candidates["dia"].extend(
+            _read_field_candidates(variant, dia_box, 40, 150)
+        )
+        region_candidates["pul"].extend(
+            _read_field_candidates(variant, pul_box, 30, 220)
+        )
+
+    systolic = _pick_stable_value(region_candidates["sys"])
+    diastolic = _pick_stable_value(region_candidates["dia"])
+    pulse = _pick_stable_value(region_candidates["pul"])
+
+    if systolic is None or diastolic is None or pulse is None:
+        return None
+    if systolic <= diastolic:
+        return None
+
+    return {
+        "systolic": systolic,
+        "diastolic": diastolic,
+        "pulse": pulse,
+        "confidence": 0.94,
+        "notes": "Lectura OCR local por sectores fijos (arriba/medio/abajo).",
+    }
+
+
 def _run_ocr_text_candidates(image_bytes: bytes) -> list[str]:
     variants = _ocr_image_variants(image_bytes)
     results: list[str] = []
@@ -512,6 +641,32 @@ def _extract_measurement_from_image(
         trace_id,
         len(image_bytes),
     )
+
+    try:
+        regional_data = _extract_measurements_by_regions(image_bytes)
+    except pytesseract.TesseractNotFoundError as exc:
+        logger.exception("[%s] Local OCR engine not found", trace_id)
+        raise RuntimeError("ocr_engine_not_found") from exc
+    except Exception as exc:
+        logger.exception("[%s] Regional OCR failed", trace_id)
+        raise RuntimeError("ocr_local_error") from exc
+
+    if regional_data is not None:
+        logger.info(
+            "[%s] Regional OCR success: SYS=%s DIA=%s PUL=%s",
+            trace_id,
+            regional_data["systolic"],
+            regional_data["diastolic"],
+            regional_data["pulse"],
+        )
+        return {
+            "sistolica": regional_data["systolic"],
+            "diastolica": regional_data["diastolic"],
+            "pulso": regional_data["pulse"],
+            "confianza_ia": regional_data["confidence"],
+            "observacion": regional_data["notes"],
+            "estado": "auto",
+        }
 
     try:
         text_candidates = _run_ocr_text_candidates(image_bytes)
