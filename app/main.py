@@ -41,6 +41,37 @@ PROCESSING_TIMEOUT_SECONDS = float(
     os.getenv("PROCESSING_TIMEOUT_SECONDS", "600")
 )
 SHEETS_TIMEOUT_SECONDS = float(os.getenv("SHEETS_TIMEOUT_SECONDS", "30"))
+WEBHOOK_DEDUP_TTL_SECONDS = int(os.getenv("WEBHOOK_DEDUP_TTL_SECONDS", "300"))
+
+_recent_update_ids: dict[int, float] = {}
+_recent_file_keys: dict[str, float] = {}
+
+
+def _cleanup_dedup_cache(now: float) -> None:
+    for cache in (_recent_update_ids, _recent_file_keys):
+        expired = [
+            k
+            for k, ts in cache.items()
+            if now - ts > WEBHOOK_DEDUP_TTL_SECONDS
+        ]
+        for key in expired:
+            cache.pop(key, None)
+
+
+def _mark_if_duplicate(update_id: int | None, file_key: str | None) -> bool:
+    now = perf_counter()
+    _cleanup_dedup_cache(now)
+
+    duplicate = False
+    if update_id is not None:
+        duplicate = update_id in _recent_update_ids
+        _recent_update_ids[update_id] = now
+
+    if file_key:
+        duplicate = duplicate or (file_key in _recent_file_keys)
+        _recent_file_keys[file_key] = now
+
+    return duplicate
 
 
 @dataclass
@@ -182,6 +213,25 @@ def _extract_triplet_from_numbers(
     return best
 
 
+def _extract_pair_from_numbers(
+    numbers: list[int],
+) -> tuple[int | None, int | None, float]:
+    best: tuple[int | None, int | None, float] = (None, None, 0.0)
+    for idx in range(max(0, len(numbers) - 1)):
+        a, b = numbers[idx], numbers[idx + 1]
+        # Most monitors show SYS first and DIA second.
+        if 70 <= a <= 250 and 40 <= b <= 150 and a > b:
+            score = 0.72
+        elif 70 <= a <= 250 and 40 <= b <= 150:
+            score = 0.55
+        else:
+            score = 0.0
+
+        if score > best[2]:
+            best = (a, b, score)
+    return best
+
+
 def _ocr_image_variants(image_bytes: bytes) -> list[Image.Image]:
     base_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     large = base_img.resize(
@@ -212,6 +262,12 @@ def _run_ocr_text_candidates(image_bytes: bytes) -> list[str]:
 
 def _extract_measurements_from_ocr_text(raw: str) -> dict[str, Any] | None:
     normalized = re.sub(r"\s+", " ", raw).strip()
+    normalized = (
+        normalized.replace("O", "0")
+        .replace("o", "0")
+        .replace("I", "1")
+        .replace("l", "1")
+    )
     if not normalized:
         return None
 
@@ -242,19 +298,33 @@ def _extract_measurements_from_ocr_text(raw: str) -> dict[str, Any] | None:
         int(match)
         for match in re.findall(r"\b\d{2,3}\b", normalized)
     ]
-    if len(numbers) < 3:
+    if len(numbers) < 2:
         return None
 
-    systolic, diastolic, pulse, score = _extract_triplet_from_numbers(numbers)
+    pulse: int | None = None
+    systolic, diastolic, triplet_pulse, score = (
+        _extract_triplet_from_numbers(numbers)
+    )
+    if systolic is not None and diastolic is not None:
+        pulse = triplet_pulse
+        return {
+            "systolic": systolic,
+            "diastolic": diastolic,
+            "pulse": pulse,
+            "confidence": score,
+            "notes": "Lectura OCR local por patron numerico.",
+        }
+
+    systolic, diastolic, pair_score = _extract_pair_from_numbers(numbers)
     if systolic is None or diastolic is None:
         return None
 
     return {
         "systolic": systolic,
         "diastolic": diastolic,
-        "pulse": pulse,
-        "confidence": score,
-        "notes": "Lectura OCR local por patron numerico.",
+        "pulse": None,
+        "confidence": pair_score,
+        "notes": "Lectura OCR local parcial (sin pulso).",
     }
 
 
@@ -400,6 +470,11 @@ def _extract_measurement_from_image(
         ocr_time,
         len(text_candidates),
     )
+    if text_candidates:
+        preview = " | ".join(
+            re.sub(r"\s+", " ", c).strip()[:110] for c in text_candidates[:3]
+        )
+        logger.info("[%s] OCR preview: %s", trace_id, preview)
 
     parsed = None
     for raw_text in text_candidates:
@@ -640,6 +715,8 @@ async def telegram_webhook(
         raise HTTPException(status_code=401, detail="invalid webhook secret")
 
     update = await request.json()
+    update_id_raw = update.get("update_id")
+    update_id = update_id_raw if isinstance(update_id_raw, int) else None
     message = update.get("message") or {}
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
@@ -674,6 +751,15 @@ async def telegram_webhook(
         )
         task.add_done_callback(_log_background_task_result)
         return JSONResponse({"ok": True, "ignored": "missing file id"})
+
+    file_key = f"{chat_id}:{file_id}"
+    if _mark_if_duplicate(update_id, file_key):
+        logger.info(
+            "Ignoring duplicated Telegram update_id=%s file_key=%s",
+            update_id,
+            file_key,
+        )
+        return JSONResponse({"ok": True, "ignored": "duplicate update"})
 
     # Send immediate confirmation message
     confirmation_task = asyncio.create_task(
