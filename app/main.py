@@ -241,7 +241,50 @@ def _ocr_image_variants(image_bytes: bytes) -> list[Image.Image]:
     gray = ImageOps.grayscale(large)
     contrasted = ImageEnhance.Contrast(gray).enhance(2.2)
     binary = contrasted.point(lambda p: 255 if p > 145 else 0)
-    return [large, gray, contrasted, binary]
+    inverted = ImageOps.invert(binary.convert("L"))
+    return [large, gray, contrasted, binary, inverted]
+
+
+def _best_number_in_range(
+    raw: str,
+    min_value: int,
+    max_value: int,
+) -> int | None:
+    numbers = [int(n) for n in re.findall(r"\b\d{2,3}\b", raw)]
+    valid = [n for n in numbers if min_value <= n <= max_value]
+    if not valid:
+        return None
+    # Keep the highest valid token; SYS/DIA/PUL tend to be displayed once.
+    return max(valid)
+
+
+def _ocr_from_monitor_regions(variant: Image.Image) -> dict[str, int | None]:
+    width, height = variant.size
+    x0 = int(width * 0.18)
+    x1 = int(width * 0.90)
+    sys_box = (x0, int(height * 0.08), x1, int(height * 0.42))
+    dia_box = (x0, int(height * 0.34), x1, int(height * 0.68))
+    pul_box = (x0, int(height * 0.62), x1, int(height * 0.96))
+
+    digit_cfg = "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"
+    sys_text = pytesseract.image_to_string(
+        variant.crop(sys_box),
+        config=digit_cfg,
+    )
+    dia_text = pytesseract.image_to_string(
+        variant.crop(dia_box),
+        config=digit_cfg,
+    )
+    pul_text = pytesseract.image_to_string(
+        variant.crop(pul_box),
+        config=digit_cfg,
+    )
+
+    return {
+        "sys": _best_number_in_range(sys_text, 70, 250),
+        "dia": _best_number_in_range(dia_text, 40, 150),
+        "pul": _best_number_in_range(pul_text, 30, 220),
+    }
 
 
 def _run_ocr_text_candidates(image_bytes: bytes) -> list[str]:
@@ -257,6 +300,22 @@ def _run_ocr_text_candidates(image_bytes: bytes) -> list[str]:
             text = pytesseract.image_to_string(variant, config=config)
             if text and text.strip():
                 results.append(text)
+
+        region_read = _ocr_from_monitor_regions(variant)
+        if region_read["sys"] is not None and region_read["dia"] is not None:
+            results.append(
+                " ".join(
+                    [
+                        f"SYS {region_read['sys']}",
+                        f"DIA {region_read['dia']}",
+                        (
+                            f"PUL {region_read['pul']}"
+                            if region_read["pul"] is not None
+                            else ""
+                        ),
+                    ]
+                ).strip()
+            )
     return results
 
 
