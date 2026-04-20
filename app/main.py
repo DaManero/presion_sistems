@@ -329,11 +329,14 @@ async def _process_telegram_photo(
             ),
             timeout=PROCESSING_TIMEOUT_SECONDS,
         )
+        logger.info(f"Gemini extraction completed for chat_id={chat_id}")
 
+        logger.info(f"Appending row to Sheets for chat_id={chat_id}")
         await asyncio.wait_for(
             asyncio.to_thread(_append_row, settings, data, file_id),
             timeout=SHEETS_TIMEOUT_SECONDS,
         )
+        logger.info(f"Row appended to Sheets for chat_id={chat_id}")
 
         if data["estado"] == "auto":
             text = (
@@ -348,6 +351,7 @@ async def _process_telegram_photo(
                 f"pulso {data.get('pulso')}."
             )
 
+        logger.info(f"Sending final message to chat_id={chat_id}")
         await _telegram_send_message(settings, chat_id, text)
         elapsed = perf_counter() - started_at
         logger.info(
