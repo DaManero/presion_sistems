@@ -1687,9 +1687,7 @@ def _append_row(
     telegram_file_id: str,
 ) -> None:
     sheet = _get_sheet(settings)
-    now = datetime.now(ZoneInfo(settings.timezone)).isoformat(
-        timespec="seconds"
-    )
+    now = datetime.now(ZoneInfo(settings.timezone)).strftime("%d/%m/%Y")
     row = [
         now,
         data.get("sistolica"),
