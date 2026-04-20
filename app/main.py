@@ -457,6 +457,71 @@ def _collect_display_row_candidates(
     return rows
 
 
+def _read_fixed_row_candidates(
+    display_img: Image.Image,
+    row_range: tuple[float, float],
+    min_value: int,
+    max_value: int,
+) -> list[tuple[int, float]]:
+    width, height = display_img.size
+    x0 = int(width * 0.16)
+    x1 = int(width * 0.92)
+    y0 = int(height * row_range[0])
+    y1 = int(height * row_range[1])
+    if x1 <= x0 or y1 <= y0:
+        return []
+
+    crop = display_img.crop((x0, y0, x1, y1)).resize(
+        (max(1, (x1 - x0) * 4), max(1, (y1 - y0) * 4)),
+        Image.Resampling.LANCZOS,
+    )
+
+    base_gray = ImageOps.autocontrast(ImageOps.grayscale(crop))
+    variants = [
+        base_gray,
+        base_gray.point(lambda p: 255 if p > 130 else 0),
+        base_gray.point(lambda p: 255 if p > 145 else 0),
+        ImageOps.invert(base_gray).point(lambda p: 255 if p > 145 else 0),
+    ]
+    configs = [
+        "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789",
+        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789",
+        "--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789",
+    ]
+
+    candidates: list[tuple[int, float]] = []
+    for prepared in variants:
+        for config in configs:
+            text = pytesseract.image_to_string(prepared, config=config)
+            numbers = _extract_valid_numbers(text, min_value, max_value)
+            for number in numbers:
+                candidates.append((number, 80.0))
+
+            data = pytesseract.image_to_data(
+                prepared,
+                config=config,
+                output_type=pytesseract.Output.DICT,
+            )
+            for idx, raw_text in enumerate(data.get("text", [])):
+                if not raw_text or not raw_text.strip():
+                    continue
+                numbers = _extract_valid_numbers(
+                    raw_text,
+                    min_value,
+                    max_value,
+                )
+                if not numbers:
+                    continue
+                try:
+                    conf = float(data.get("conf", ["0"])[idx])
+                except (TypeError, ValueError, IndexError):
+                    conf = 0.0
+                for number in numbers:
+                    candidates.append((number, conf))
+
+    return candidates
+
+
 def _extract_measurements_by_regions(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
@@ -501,6 +566,54 @@ def _extract_measurements_by_regions(
             "pulse": pulse,
             "confidence": 0.95,
             "notes": "Lectura OCR local por filas del display.",
+        }
+
+    fixed_row_sys = _read_fixed_row_candidates(
+        display_img,
+        (0.08, 0.38),
+        70,
+        250,
+    )
+    fixed_row_dia = _read_fixed_row_candidates(
+        display_img,
+        (0.34, 0.64),
+        40,
+        150,
+    )
+    fixed_row_pul = _read_fixed_row_candidates(
+        display_img,
+        (0.62, 0.94),
+        30,
+        220,
+    )
+    logger.info(
+        "Fixed-row OCR candidates SYS=%s DIA=%s PUL=%s",
+        [v for v, _ in fixed_row_sys[:10]],
+        [v for v, _ in fixed_row_dia[:10]],
+        [v for v, _ in fixed_row_pul[:10]],
+    )
+
+    systolic = _pick_weighted_value(fixed_row_sys)
+    diastolic = _pick_weighted_value(fixed_row_dia)
+    pulse = _pick_weighted_value(fixed_row_pul)
+    if (
+        systolic is not None
+        and diastolic is not None
+        and pulse is not None
+        and systolic > diastolic
+    ):
+        logger.info(
+            "Fixed-row OCR success SYS=%s DIA=%s PUL=%s",
+            systolic,
+            diastolic,
+            pulse,
+        )
+        return {
+            "systolic": systolic,
+            "diastolic": diastolic,
+            "pulse": pulse,
+            "confidence": 0.96,
+            "notes": "Lectura OCR local por filas fijas del display.",
         }
 
     region_candidates = {
@@ -761,7 +874,13 @@ def _optimize_image(image_bytes: bytes) -> bytes:
 
         # Compress and save
         output = io.BytesIO()
-        img.save(output, format="JPEG", quality=85, optimize=True)
+        img.save(
+            output,
+            format="JPEG",
+            quality=95,
+            optimize=False,
+            subsampling=0,
+        )
         return output.getvalue()
     except Exception:
         # If optimization fails, return original
