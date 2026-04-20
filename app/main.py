@@ -332,6 +332,8 @@ def _extract_measurement_from_image(
             exc.response.status_code,
             body_preview,
         )
+        if exc.response.status_code == 429:
+            raise RuntimeError("gemini_quota_exceeded") from exc
         raise RuntimeError("gemini_http_error") from exc
     except httpx.HTTPError as exc:
         logger.exception("[%s] Gemini transport error", trace_id)
@@ -538,7 +540,12 @@ async def _process_telegram_photo(
             "Hubo un error al procesar la imagen. "
             "Intenta de nuevo con una foto mas clara."
         )
-        if isinstance(exc, RuntimeError) and str(exc).startswith("gemini_"):
+        if str(exc) == "gemini_quota_exceeded":
+            error_text = (
+                "Gemini llego al limite de cuota del plan actual. "
+                "Intenta mas tarde o habilita facturacion en Google AI."
+            )
+        elif isinstance(exc, RuntimeError) and str(exc).startswith("gemini_"):
             error_text = (
                 "No pude conectar con Gemini en este momento. "
                 "Intenta de nuevo en unos minutos."
