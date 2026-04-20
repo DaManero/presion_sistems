@@ -319,6 +319,28 @@ def _pick_stable_value(candidates: list[int]) -> int | None:
     return max(top_values)
 
 
+def _pick_weighted_value(
+    candidates: list[tuple[int, float]],
+) -> int | None:
+    if not candidates:
+        return None
+
+    scores: dict[int, float] = {}
+    for value, weight in candidates:
+        scores[value] = scores.get(value, 0.0) + max(weight, 1.0)
+
+    best_value = None
+    best_score = -1.0
+    for value, score in scores.items():
+        same_score_higher_value = (
+            score == best_score and value > (best_value or -1)
+        )
+        if score > best_score or same_score_higher_value:
+            best_value = value
+            best_score = score
+    return best_value
+
+
 def _read_field_candidates(
     variant: Image.Image,
     box: tuple[int, int, int, int],
@@ -369,18 +391,125 @@ def _read_field_candidates(
     return numbers
 
 
+def _collect_display_row_candidates(
+    display_img: Image.Image,
+) -> dict[str, list[tuple[int, float]]]:
+    rows: dict[str, list[tuple[int, float]]] = {
+        "sys": [],
+        "dia": [],
+        "pul": [],
+    }
+
+    configs = [
+        "--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789",
+        "--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789",
+    ]
+
+    variants = [
+        ImageOps.autocontrast(ImageOps.grayscale(display_img)),
+    ]
+    variants.append(variants[0].point(lambda p: 255 if p > 145 else 0))
+
+    for prepared in variants:
+        for config in configs:
+            data = pytesseract.image_to_data(
+                prepared,
+                config=config,
+                output_type=pytesseract.Output.DICT,
+            )
+            height = max(1, prepared.height)
+            for idx, raw_text in enumerate(data.get("text", [])):
+                if not raw_text or not raw_text.strip():
+                    continue
+
+                try:
+                    conf = float(data.get("conf", ["0"])[idx])
+                except (TypeError, ValueError, IndexError):
+                    conf = 0.0
+
+                numbers_sys = _extract_valid_numbers(raw_text, 70, 250)
+                numbers_dia = _extract_valid_numbers(raw_text, 40, 150)
+                numbers_pul = _extract_valid_numbers(raw_text, 30, 220)
+                if not (numbers_sys or numbers_dia or numbers_pul):
+                    continue
+
+                try:
+                    y = float(data.get("top", [0])[idx])
+                    h = float(data.get("height", [0])[idx])
+                except (TypeError, ValueError, IndexError):
+                    y = 0.0
+                    h = 0.0
+
+                y_center_ratio = (y + (h / 2.0)) / height
+                if y_center_ratio < 0.34:
+                    row_key = "sys"
+                    row_numbers = numbers_sys
+                elif y_center_ratio < 0.68:
+                    row_key = "dia"
+                    row_numbers = numbers_dia
+                else:
+                    row_key = "pul"
+                    row_numbers = numbers_pul
+
+                for number in row_numbers:
+                    rows[row_key].append((number, conf))
+
+    return rows
+
+
 def _extract_measurements_by_regions(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
     base = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    # This monitor is centered; keeping original scale preserves digit shape.
-    prepared_variant = ImageOps.autocontrast(ImageOps.grayscale(base))
+    width, height = base.size
+
+    # Main display window for Omron framing.
+    display_box = (
+        int(width * 0.24),
+        int(height * 0.17),
+        int(width * 0.82),
+        int(height * 0.80),
+    )
+    display_img = base.crop(display_box).resize(
+        (
+            max(1, int((display_box[2] - display_box[0]) * 2.4)),
+            max(1, int((display_box[3] - display_box[1]) * 2.4)),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+
+    rows = _collect_display_row_candidates(display_img)
+    systolic = _pick_weighted_value(rows["sys"])
+    diastolic = _pick_weighted_value(rows["dia"])
+    pulse = _pick_weighted_value(rows["pul"])
+
+    if (
+        systolic is not None
+        and diastolic is not None
+        and pulse is not None
+        and systolic > diastolic
+    ):
+        logger.info(
+            "Display-row OCR success SYS=%s DIA=%s PUL=%s",
+            systolic,
+            diastolic,
+            pulse,
+        )
+        return {
+            "systolic": systolic,
+            "diastolic": diastolic,
+            "pulse": pulse,
+            "confidence": 0.95,
+            "notes": "Lectura OCR local por filas del display.",
+        }
+
     region_candidates = {
         "sys": [],
         "dia": [],
         "pul": [],
     }
 
+    prepared_variant = ImageOps.autocontrast(ImageOps.grayscale(base))
     width, height = prepared_variant.size
     # Tuned for Omron framing: right display, 3 stacked numeric rows.
     x0 = int(width * 0.30)
