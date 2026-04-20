@@ -33,9 +33,9 @@ REQUIRED_ENV_VARS = [
 ]
 
 PROCESSING_TIMEOUT_SECONDS = float(
-    os.getenv("PROCESSING_TIMEOUT_SECONDS", "300")
+    os.getenv("PROCESSING_TIMEOUT_SECONDS", "600")
 )
-GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "300"))
 SHEETS_TIMEOUT_SECONDS = float(os.getenv("SHEETS_TIMEOUT_SECONDS", "30"))
 
 
@@ -193,6 +193,8 @@ def _extract_measurement_from_image(
     image_bytes: bytes,
     mime_type: str,
 ) -> dict[str, Any]:
+    step_start = perf_counter()
+    
     prompt = (
         "Extract blood pressure values from this image of a pressure monitor. "
         "Return only JSON with keys: systolic, diastolic, pulse, "
@@ -200,9 +202,17 @@ def _extract_measurement_from_image(
         "Rules: all values must be integers, confidence from 0 to 1. "
         "If any value is not readable, set it to null and explain in notes."
     )
+    logger.info("Configuring Gemini API")
     genai.configure(api_key=settings.gemini_api_key)
+    config_time = perf_counter() - step_start
+    logger.info(f"Gemini API configured in {config_time:.2f}s")
+    
     model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    logger.info(f"Creating Gemini model: {model_name}")
     gemini_model = genai.GenerativeModel(model_name)
+    
+    step_start = perf_counter()
+    logger.info(f"Sending image to Gemini (size={len(image_bytes)} bytes)")
     response = gemini_model.generate_content(
         [
             {
@@ -214,6 +224,9 @@ def _extract_measurement_from_image(
         generation_config={"response_mime_type": "application/json"},
         request_options={"timeout": GEMINI_TIMEOUT_SECONDS},
     )
+    gemini_time = perf_counter() - step_start
+    logger.info(f"Gemini response received in {gemini_time:.2f}s")
+    
     raw = response.text or ""
     parsed = _clean_json(raw)
 
