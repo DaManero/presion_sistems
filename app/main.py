@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from PIL import Image
 import google.generativeai as genai
 
 load_dotenv()
@@ -31,9 +33,9 @@ REQUIRED_ENV_VARS = [
 ]
 
 PROCESSING_TIMEOUT_SECONDS = float(
-    os.getenv("PROCESSING_TIMEOUT_SECONDS", "150")
+    os.getenv("PROCESSING_TIMEOUT_SECONDS", "300")
 )
-GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "90"))
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))
 SHEETS_TIMEOUT_SECONDS = float(os.getenv("SHEETS_TIMEOUT_SECONDS", "30"))
 
 
@@ -164,6 +166,28 @@ async def _telegram_send_message(
         resp.raise_for_status()
 
 
+def _optimize_image(image_bytes: bytes) -> bytes:
+    """Compress and optimize image for faster Gemini processing."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        # Resize if image is too large (max 1920px on longest side)
+        max_size = 1920
+        img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+        # Convert to RGB if necessary
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        
+        # Compress and save
+        output = io.BytesIO()
+        img.save(output, format="JPEG", quality=85, optimize=True)
+        return output.getvalue()
+    except Exception:
+        # If optimization fails, return original
+        return image_bytes
+
+
 def _extract_measurement_from_image(
     settings: Settings,
     image_bytes: bytes,
@@ -267,12 +291,21 @@ async def _process_telegram_photo(
             len(image_bytes),
         )
 
+        # Optimize image for faster processing
+        optimized_bytes = await asyncio.to_thread(_optimize_image, image_bytes)
+        logger.info(
+            "Optimized image chat_id=%s original_size=%s optimized_size=%s",
+            chat_id,
+            len(image_bytes),
+            len(optimized_bytes),
+        )
+
         data = await asyncio.wait_for(
             asyncio.to_thread(
                 _extract_measurement_from_image,
                 settings,
-                image_bytes,
-                mime_type,
+                optimized_bytes,
+                "image/jpeg",
             ),
             timeout=PROCESSING_TIMEOUT_SECONDS,
         )
