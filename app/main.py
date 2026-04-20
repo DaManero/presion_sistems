@@ -188,6 +188,20 @@ async def _telegram_send_message(
         raise
 
 
+async def _safe_telegram_send_message(
+    settings: Settings,
+    chat_id: int,
+    text: str,
+) -> None:
+    try:
+        await _telegram_send_message(settings, chat_id, text)
+    except Exception:
+        logger.exception(
+            "Could not deliver Telegram message chat_id=%s",
+            chat_id,
+        )
+
+
 def _optimize_image(image_bytes: bytes) -> bytes:
     """Compress and optimize image for faster Gemini processing."""
     try:
@@ -413,7 +427,7 @@ async def _process_telegram_photo(
             file_id,
             elapsed,
         )
-        await _telegram_send_message(
+        await _safe_telegram_send_message(
             settings,
             chat_id,
             "La imagen tardo demasiado en procesarse. "
@@ -428,7 +442,7 @@ async def _process_telegram_photo(
             file_id,
             elapsed,
         )
-        await _telegram_send_message(
+        await _safe_telegram_send_message(
             settings,
             chat_id,
             "Hubo un error al procesar la imagen. "
