@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
@@ -228,6 +229,7 @@ def _extract_measurement_from_image(
     settings: Settings,
     image_bytes: bytes,
     mime_type: str,
+    trace_id: str,
 ) -> dict[str, Any]:
     step_start = perf_counter()
 
@@ -244,7 +246,8 @@ def _extract_measurement_from_image(
 
     step_start = perf_counter()
     logger.info(
-        "Sending image to Gemini REST API (model=%s size=%s bytes)",
+        "[%s] Sending image to Gemini REST API (model=%s size=%s bytes)",
+        trace_id,
         model_name,
         len(image_bytes),
     )
@@ -257,8 +260,8 @@ def _extract_measurement_from_image(
             {
                 "parts": [
                     {
-                        "inline_data": {
-                            "mime_type": mime_type,
+                        "inlineData": {
+                            "mimeType": mime_type,
                             "data": base64.b64encode(image_bytes).decode(
                                 "ascii"
                             ),
@@ -271,13 +274,35 @@ def _extract_measurement_from_image(
         "generationConfig": {"responseMimeType": "application/json"},
     }
 
-    with httpx.Client(timeout=GEMINI_TIMEOUT_SECONDS) as client:
-        response = client.post(
-            gemini_url,
-            params={"key": settings.gemini_api_key},
-            json=payload,
+    timeout = httpx.Timeout(
+        connect=min(15.0, GEMINI_TIMEOUT_SECONDS),
+        read=GEMINI_TIMEOUT_SECONDS,
+        write=min(30.0, GEMINI_TIMEOUT_SECONDS),
+        pool=min(15.0, GEMINI_TIMEOUT_SECONDS),
+    )
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(
+                gemini_url,
+                headers={"x-goog-api-key": settings.gemini_api_key},
+                json=payload,
+            )
+            response.raise_for_status()
+    except httpx.TimeoutException as exc:
+        logger.exception("[%s] Gemini request timed out", trace_id)
+        raise RuntimeError("gemini_timeout") from exc
+    except httpx.HTTPStatusError as exc:
+        body_preview = exc.response.text[:600]
+        logger.error(
+            "[%s] Gemini HTTP error status=%s body=%s",
+            trace_id,
+            exc.response.status_code,
+            body_preview,
         )
-        response.raise_for_status()
+        raise RuntimeError("gemini_http_error") from exc
+    except httpx.HTTPError as exc:
+        logger.exception("[%s] Gemini transport error", trace_id)
+        raise RuntimeError("gemini_transport_error") from exc
 
     response_json = response.json()
     candidates = response_json.get("candidates") or []
@@ -291,7 +316,11 @@ def _extract_measurement_from_image(
         raise ValueError("Gemini response missing text payload")
 
     gemini_time = perf_counter() - step_start
-    logger.info(f"Gemini response received in {gemini_time:.2f}s")
+    logger.info(
+        "[%s] Gemini response received in %.2fs",
+        trace_id,
+        gemini_time,
+    )
 
     parsed = _clean_json(raw)
 
@@ -352,8 +381,10 @@ async def _process_telegram_photo(
     file_id: str,
 ) -> None:
     started_at = perf_counter()
+    trace_id = uuid.uuid4().hex[:8]
     logger.info(
-        "Start processing Telegram photo chat_id=%s file_id=%s",
+        "[%s] Start processing Telegram photo chat_id=%s file_id=%s",
+        trace_id,
         chat_id,
         file_id,
     )
@@ -362,7 +393,9 @@ async def _process_telegram_photo(
 
         image_bytes = await _telegram_download_file(settings, file_path)
         logger.info(
-            "Downloaded Telegram photo chat_id=%s file_id=%s size_bytes=%s",
+            "[%s] Downloaded Telegram photo chat_id=%s "
+            "file_id=%s size_bytes=%s",
+            trace_id,
             chat_id,
             file_id,
             len(image_bytes),
@@ -371,7 +404,9 @@ async def _process_telegram_photo(
         # Optimize image for faster processing
         optimized_bytes = await asyncio.to_thread(_optimize_image, image_bytes)
         logger.info(
-            "Optimized image chat_id=%s original_size=%s optimized_size=%s",
+            "[%s] Optimized image chat_id=%s "
+            "original_size=%s optimized_size=%s",
+            trace_id,
             chat_id,
             len(image_bytes),
             len(optimized_bytes),
@@ -383,17 +418,30 @@ async def _process_telegram_photo(
                 settings,
                 optimized_bytes,
                 "image/jpeg",
+                trace_id,
             ),
             timeout=PROCESSING_TIMEOUT_SECONDS,
         )
-        logger.info(f"Gemini extraction completed for chat_id={chat_id}")
+        logger.info(
+            "[%s] Gemini extraction completed for chat_id=%s",
+            trace_id,
+            chat_id,
+        )
 
-        logger.info(f"Appending row to Sheets for chat_id={chat_id}")
+        logger.info(
+            "[%s] Appending row to Sheets for chat_id=%s",
+            trace_id,
+            chat_id,
+        )
         await asyncio.wait_for(
             asyncio.to_thread(_append_row, settings, data, file_id),
             timeout=SHEETS_TIMEOUT_SECONDS,
         )
-        logger.info(f"Row appended to Sheets for chat_id={chat_id}")
+        logger.info(
+            "[%s] Row appended to Sheets for chat_id=%s",
+            trace_id,
+            chat_id,
+        )
 
         if data["estado"] == "auto":
             text = (
@@ -408,12 +456,17 @@ async def _process_telegram_photo(
                 f"pulso {data.get('pulso')}."
             )
 
-        logger.info(f"Sending final message to chat_id={chat_id}")
+        logger.info(
+            "[%s] Sending final message to chat_id=%s",
+            trace_id,
+            chat_id,
+        )
         await _telegram_send_message(settings, chat_id, text)
         elapsed = perf_counter() - started_at
         logger.info(
-            "Finished processing Telegram photo "
+            "[%s] Finished processing Telegram photo "
             "chat_id=%s file_id=%s elapsed=%.2fs",
+            trace_id,
             chat_id,
             file_id,
             elapsed,
@@ -421,8 +474,9 @@ async def _process_telegram_photo(
     except TimeoutError:
         elapsed = perf_counter() - started_at
         logger.exception(
-            "Timeout processing Telegram photo "
+            "[%s] Timeout processing Telegram photo "
             "chat_id=%s file_id=%s elapsed=%.2fs",
+            trace_id,
             chat_id,
             file_id,
             elapsed,
@@ -433,20 +487,30 @@ async def _process_telegram_photo(
             "La imagen tardo demasiado en procesarse. "
             "Intenta de nuevo con una foto bien iluminada y enfocada.",
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         elapsed = perf_counter() - started_at
         logger.exception(
-            "Error processing Telegram photo "
+            "[%s] Error processing Telegram photo "
             "chat_id=%s file_id=%s elapsed=%.2fs",
+            trace_id,
             chat_id,
             file_id,
             elapsed,
         )
+        # If Gemini fails, communicate that explicitly to speed up diagnosis.
+        error_text = (
+            "Hubo un error al procesar la imagen. "
+            "Intenta de nuevo con una foto mas clara."
+        )
+        if isinstance(exc, RuntimeError) and str(exc).startswith("gemini_"):
+            error_text = (
+                "No pude conectar con Gemini en este momento. "
+                "Intenta de nuevo en unos minutos."
+            )
         await _safe_telegram_send_message(
             settings,
             chat_id,
-            "Hubo un error al procesar la imagen. "
-            "Intenta de nuevo con una foto mas clara.",
+            error_text,
         )
 
 
