@@ -8,6 +8,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from time import perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -402,6 +403,133 @@ def _pick_best_in_range(candidates: list[int]) -> int | None:
     return _pick_stable_value(filtered)
 
 
+def _seven_segment_digit_patterns() -> dict[str, tuple[int, ...]]:
+    patterns: dict[str, tuple[int, ...]] = {}
+    for pattern, digit in SEVEN_SEGMENT_DIGITS.items():
+        patterns[digit] = pattern
+    return patterns
+
+
+@lru_cache(maxsize=1)
+def _build_seven_segment_templates() -> dict[str, np.ndarray]:
+    templates: dict[str, np.ndarray] = {}
+    patterns = _seven_segment_digit_patterns()
+    width, height = 80, 140
+
+    segments_boxes = [
+        (18, 5, 62, 22),
+        (6, 18, 22, 66),
+        (58, 18, 74, 66),
+        (18, 58, 62, 82),
+        (6, 74, 22, 122),
+        (58, 74, 74, 122),
+        (18, 118, 62, 136),
+    ]
+
+    for digit, pattern in patterns.items():
+        canvas = np.zeros((height, width), dtype=np.uint8)
+        for idx, is_on in enumerate(pattern):
+            if not is_on:
+                continue
+            x0, y0, x1, y1 = segments_boxes[idx]
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), 255, -1)
+        templates[digit] = canvas
+    return templates
+
+
+def _opencv_normalize_digit(slot: np.ndarray) -> np.ndarray | None:
+    ys, xs = np.where(slot > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    cropped = slot[y0:y1, x0:x1]
+    if cropped.size == 0:
+        return None
+
+    normalized = cv2.resize(
+        cropped,
+        (80, 140),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    _, normalized = cv2.threshold(normalized, 127, 255, cv2.THRESH_BINARY)
+    return normalized
+
+
+def _opencv_classify_digit(slot: np.ndarray) -> str | None:
+    normalized = _opencv_normalize_digit(slot)
+    if normalized is None:
+        return None
+
+    templates = _build_seven_segment_templates()
+    best_digit = None
+    best_score = -1.0
+    for digit, template in templates.items():
+        score = cv2.matchTemplate(
+            normalized,
+            template,
+            cv2.TM_CCOEFF_NORMED,
+        )[0][0]
+        if score > best_score:
+            best_score = score
+            best_digit = digit
+
+    if best_score < 0.20:
+        return None
+    return best_digit
+
+
+def _opencv_decode_row_value(
+    binary_img: np.ndarray,
+    row_box: tuple[float, float, float, float],
+    digit_count: int,
+) -> int | None:
+    height, width = binary_img.shape[:2]
+    x0 = int(width * row_box[0])
+    y0 = int(height * row_box[1])
+    x1 = int(width * row_box[2])
+    y1 = int(height * row_box[3])
+    row = binary_img[y0:y1, x0:x1]
+    if row.size == 0:
+        return None
+
+    col_sum = np.sum(row > 0, axis=0)
+    active_cols = np.where(col_sum > max(2, int(row.shape[0] * 0.06)))[0]
+    if len(active_cols) == 0:
+        return None
+
+    start = int(active_cols.min())
+    end = int(active_cols.max()) + 1
+    strip = row[:, start:end]
+    if strip.size == 0:
+        return None
+
+    slot_width = strip.shape[1] / float(digit_count)
+    if slot_width <= 2:
+        return None
+
+    digits: list[str] = []
+    for idx in range(digit_count):
+        sx0 = int(round(idx * slot_width))
+        sx1 = int(round((idx + 1) * slot_width))
+        pad = max(1, int((sx1 - sx0) * 0.08))
+        sx0 = max(0, sx0 - pad)
+        sx1 = min(strip.shape[1], sx1 + pad)
+        if sx1 <= sx0:
+            return None
+        slot = strip[:, sx0:sx1]
+        digit = _opencv_classify_digit(slot)
+        if digit is None:
+            return None
+        digits.append(digit)
+
+    try:
+        return int("".join(digits))
+    except ValueError:
+        return None
+
+
 def _extract_measurements_with_opencv(
     image_bytes: bytes,
 ) -> dict[str, Any] | None:
@@ -453,22 +581,31 @@ def _extract_measurements_with_opencv(
     ]
 
     row_boxes = {
-        "sys": ((0.18, 0.14, 0.76, 0.40), 3, 70, 250),
-        "dia": ((0.24, 0.40, 0.74, 0.68), 2, 40, 150),
-        "pul": ((0.37, 0.73, 0.71, 0.94), 2, 30, 220),
+        "sys": [
+            ((0.18, 0.14, 0.76, 0.40), 3, 70, 250),
+            ((0.20, 0.15, 0.78, 0.41), 3, 70, 250),
+        ],
+        "dia": [
+            ((0.24, 0.40, 0.74, 0.68), 2, 40, 150),
+            ((0.26, 0.40, 0.72, 0.68), 2, 40, 150),
+        ],
+        "pul": [
+            ((0.37, 0.73, 0.71, 0.94), 2, 30, 220),
+            ((0.40, 0.72, 0.72, 0.94), 2, 30, 220),
+        ],
     }
     candidates: dict[str, list[int]] = {"sys": [], "dia": [], "pul": []}
 
     for threshold_variant in threshold_variants:
-        pil_variant = Image.fromarray(threshold_variant)
-        for key, (row_box, digits, min_value, max_value) in row_boxes.items():
-            value = _decode_row_with_seven_segments(
-                pil_variant,
-                row_box,
-                digits,
-            )
-            if value is not None and min_value <= value <= max_value:
-                candidates[key].append(value)
+        for key, row_options in row_boxes.items():
+            for row_box, digits, min_value, max_value in row_options:
+                value = _opencv_decode_row_value(
+                    threshold_variant,
+                    row_box,
+                    digits,
+                )
+                if value is not None and min_value <= value <= max_value:
+                    candidates[key].append(value)
 
     logger.info(
         "OpenCV display OCR SYS=%s DIA=%s PUL=%s",
