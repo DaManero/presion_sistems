@@ -55,10 +55,18 @@ Definir en Railway:
 - GOOGLE_SERVICE_ACCOUNT_JSON
 - TZ=America/Argentina/Buenos_Aires
 
+Opcionales (recomendado):
+
+- GEMINI_MODEL=gemini-1.5-flash
+- PROCESSING_TIMEOUT_SECONDS=150
+- GEMINI_TIMEOUT_SECONDS=90
+- SHEETS_TIMEOUT_SECONDS=30
+
 Notas:
 
 - GOOGLE_SERVICE_ACCOUNT_JSON debe contener el JSON completo de la service account en una sola variable.
 - Compartir el Google Sheet con el email de la service account (permiso editor).
+- Si notas demoras o timeouts, ajustar los valores opcionales de timeout segun tu red/hosting.
 
 ## Seguridad minima recomendada
 

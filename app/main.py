@@ -4,6 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from time import perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,12 @@ REQUIRED_ENV_VARS = [
     "GOOGLE_SHEETS_ID",
     "GOOGLE_SERVICE_ACCOUNT_JSON",
 ]
+
+PROCESSING_TIMEOUT_SECONDS = float(
+    os.getenv("PROCESSING_TIMEOUT_SECONDS", "150")
+)
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "90"))
+SHEETS_TIMEOUT_SECONDS = float(os.getenv("SHEETS_TIMEOUT_SECONDS", "30"))
 
 
 @dataclass
@@ -101,6 +108,15 @@ def _is_valid_range(systolic: int, diastolic: int, pulse: int) -> bool:
     )
 
 
+def _guess_mime_type(file_path: str) -> str:
+    lower_path = file_path.lower()
+    if lower_path.endswith(".png"):
+        return "image/png"
+    if lower_path.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
 async def _telegram_get_file_path(settings: Settings, file_id: str) -> str:
     telegram_api_base = (
         f"https://api.telegram.org/bot{settings.telegram_bot_token}"
@@ -151,6 +167,7 @@ async def _telegram_send_message(
 def _extract_measurement_from_image(
     settings: Settings,
     image_bytes: bytes,
+    mime_type: str,
 ) -> dict[str, Any]:
     prompt = (
         "Extract blood pressure values from this image of a pressure monitor. "
@@ -160,15 +177,18 @@ def _extract_measurement_from_image(
         "If any value is not readable, set it to null and explain in notes."
     )
     genai.configure(api_key=settings.gemini_api_key)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    gemini_model = genai.GenerativeModel(model_name)
     response = gemini_model.generate_content(
         [
             {
-                "mime_type": "image/jpeg",
+                "mime_type": mime_type,
                 "data": image_bytes,
             },
             prompt,
-        ]
+        ],
+        generation_config={"response_mime_type": "application/json"},
+        request_options={"timeout": GEMINI_TIMEOUT_SECONDS},
     )
     raw = response.text or ""
     parsed = _clean_json(raw)
@@ -229,11 +249,38 @@ async def _process_telegram_photo(
     chat_id: int,
     file_id: str,
 ) -> None:
+    started_at = perf_counter()
+    logger.info(
+        "Start processing Telegram photo chat_id=%s file_id=%s",
+        chat_id,
+        file_id,
+    )
     try:
         file_path = await _telegram_get_file_path(settings, file_id)
+        mime_type = _guess_mime_type(file_path)
+
         image_bytes = await _telegram_download_file(settings, file_path)
-        data = _extract_measurement_from_image(settings, image_bytes)
-        _append_row(settings, data, file_id)
+        logger.info(
+            "Downloaded Telegram photo chat_id=%s file_id=%s size_bytes=%s",
+            chat_id,
+            file_id,
+            len(image_bytes),
+        )
+
+        data = await asyncio.wait_for(
+            asyncio.to_thread(
+                _extract_measurement_from_image,
+                settings,
+                image_bytes,
+                mime_type,
+            ),
+            timeout=PROCESSING_TIMEOUT_SECONDS,
+        )
+
+        await asyncio.wait_for(
+            asyncio.to_thread(_append_row, settings, data, file_id),
+            timeout=SHEETS_TIMEOUT_SECONDS,
+        )
 
         if data["estado"] == "auto":
             text = (
@@ -249,8 +296,38 @@ async def _process_telegram_photo(
             )
 
         await _telegram_send_message(settings, chat_id, text)
+        elapsed = perf_counter() - started_at
+        logger.info(
+            "Finished processing Telegram photo "
+            "chat_id=%s file_id=%s elapsed=%.2fs",
+            chat_id,
+            file_id,
+            elapsed,
+        )
+    except TimeoutError:
+        elapsed = perf_counter() - started_at
+        logger.exception(
+            "Timeout processing Telegram photo "
+            "chat_id=%s file_id=%s elapsed=%.2fs",
+            chat_id,
+            file_id,
+            elapsed,
+        )
+        await _telegram_send_message(
+            settings,
+            chat_id,
+            "La imagen tardo demasiado en procesarse. "
+            "Intenta de nuevo con una foto bien iluminada y enfocada.",
+        )
     except Exception:  # noqa: BLE001
-        logger.exception("Error processing Telegram webhook")
+        elapsed = perf_counter() - started_at
+        logger.exception(
+            "Error processing Telegram photo "
+            "chat_id=%s file_id=%s elapsed=%.2fs",
+            chat_id,
+            file_id,
+            elapsed,
+        )
         await _telegram_send_message(
             settings,
             chat_id,
